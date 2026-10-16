@@ -1,0 +1,20 @@
+[project]
+name = "frontend-developer-fte"
+version = "0.1.0"
+description = "Frontend Developer Digital FTE"
+requires-python = ">=3.10"
+dependencies = [
+  "openai-agents>=0.17.8",
+  "python-dotenv>=1.0.0",
+  "pydantic>=2.0",
+  "psycopg[binary]>=3.2",
+  "sqlalchemy[asyncio]>=2.0",
+  "asyncpg>=0.30",
+  "greenlet>=3.0",
+  "pgvector>=0.3",
+  "ddgs>=9.16.0",
+]
+
+[tool.uv]
+# The project is a standalone worker script, not an installable package.
+package = false

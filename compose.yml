@@ -1,0 +1,49 @@
+# Deployment shape for the Frontend Developer Digital FTE.
+#
+# Worker and scoped MCP server run in one container: the worker launches the MCP
+# server as a stdio child, so they share a lifecycle and need no service mesh.
+#
+# NOTE: provided but NOT verified. Docker was unavailable in this environment.
+
+services:
+  fte:
+    build: .
+    # One turn per invocation keeps session and approval state simple to reason
+    # about; scale with a queue rather than with in-process concurrency.
+    command: ["uv", "run", "python", "worker.py"]
+    working_dir: /app
+    environment:
+      NEON_DATABASE_URL: ${NEON_DATABASE_URL}
+      MCP_TRANSPORT: stdio
+      GEMINI_ENABLED: "1"
+      # Disabled until a funded, valid OpenAI key is in place.
+      OPENAI_ENABLED: "0"
+      PROVIDER_COOLDOWN_SECONDS: "900"
+      # Leave unset unless this host may publish to production.
+      ALLOW_PRODUCTION_PUBLISH: ""
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Optional: a long-lived HTTP MCP surface for other consumers.
+  # The agent itself uses stdio and does not need this.
+  mcp-http:
+    build: .
+    command: ["uv", "run", "python", "-m", "frontend_workspace_mcp.server"]
+    working_dir: /app
+    environment:
+      NEON_DATABASE_URL: ${NEON_DATABASE_URL}
+      MCP_TRANSPORT: streamable-http
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8001"
+      GEMINI_ENABLED: "1"
+      OPENAI_ENABLED: "0"
+    ports:
+      - "127.0.0.1:8001:8001"
+    restart: unless-stopped
+    profiles: ["mcp-http"]
