@@ -1,6 +1,6 @@
 ---
 name: escalate-review
-description: Prepare a frontend engineering escalation package for a human reviewer or another engineer to act on. Use when ANY of these is true: a QA or review process blocked the work; the user is visibly frustrated or sends negative sentiment; there is an accessibility, WCAG, or legal-adjacent risk; the user asks to hand it off, hand it over, get a second opinion, or send it for human review; or a high-impact issue is still unresolved. Triggers on "hand this off", "hand this over", "another engineer", "get a second opinion", "send for review", "QC blocked this", "escalate this". Do NOT use for routine drafting, for a written note or summary about a task (that is summarize-component), for generic documentation lookup, or for creating a component.
+description: Prepare a frontend engineering escalation package for a human reviewer or another engineer to act on. Use when ANY of these is true: a QA or review process blocked the work ("QA blocked this", "review blocked it", "QA sign-off refused"); the user is visibly frustrated or sends negative sentiment; there is an accessibility, WCAG, or legal-adjacent risk; the user asks to hand it off, hand this off, hand it over, or get a second opinion, or send it for human review; or a high-impact issue is still unresolved. Triggers on "hand this off", "hand it off", "hand this over", "another engineer", "get a second opinion", "send for review", "QC blocked this", "QA blocked this", "escalate this". Do NOT use for routine drafting, for a written note or summary about a task (that is summarize-component), for generic documentation lookup, or for creating a component.
 ---
 
 # Escalate Review
@@ -47,6 +47,7 @@ If either condition fails, do not escalate. Write the ordinary answer instead.
 ### Should fire
 - "user is frustrated and says this keeps failing"
 - "QC blocked this on WCAG grounds"
+- "QA blocked this on accessibility grounds; hand it off"
 - "please hand this to another engineer"
 - "the public-facing quality path is unclear"
 

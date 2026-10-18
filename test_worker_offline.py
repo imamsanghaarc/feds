@@ -414,9 +414,13 @@ def test_single_publish_path_and_approval_gate() -> None:
 
     policy = worker._mcp_server("test")._needs_approval_policy
     check(
-        "only publish_task is gated",
+        "both promotion writes are gated; reads stay free",
         policy.get("publish_task") is True
-        and not any(v for k, v in policy.items() if k != "publish_task"),
+        and policy.get("promote_memory") is True
+        and not any(
+            v for k, v in policy.items()
+            if k not in {"publish_task", "promote_memory"}
+        ),
         str(policy),
     )
 
@@ -493,11 +497,15 @@ def test_system_prompt_tool_names_are_real() -> None:
         "save_task",
         "record_review",
         "publish_task",
+        "save_memory",
+        "list_memories",
+        "delete_memory",
+        "promote_memory",
     }
     # Tool names referenced in backticks that look like workspace calls.
     import re
 
-    referenced = set(re.findall(r"`(lookup_[a-z_]+|list_[a-z_]+|find_[a-z_]+|save_[a-z_]+|record_[a-z_]+|publish_[a-z_]+)`", prompt))
+    referenced = set(re.findall(r"`(lookup_[a-z_]+|list_[a-z_]+|find_[a-z_]+|save_[a-z_]+|record_[a-z_]+|publish_[a-z_]+|delete_[a-z_]+|promote_[a-z_]+)`", prompt))
     unknown = referenced - real_tools
     check("prompt references only real tools", not unknown, f"unknown={unknown}")
     check(
@@ -774,6 +782,47 @@ def test_replay_reports_cost_rollups() -> None:
     check("the CLI exposes --costs", "--costs" in source)
 
 
+MEMORY_TOOLS = {"save_memory", "list_memories", "delete_memory", "promote_memory"}
+
+
+def test_memory_tools_are_registered() -> None:
+    names = set(dir(mcp_server))
+    check("all four memory tools exist as module functions", MEMORY_TOOLS.issubset(names),
+          str(sorted(MEMORY_TOOLS - names)))
+    for tool in MEMORY_TOOLS:
+        source = inspect.getsource(getattr(mcp_server, tool))
+        check(f"{tool} routes through the metrics wrapper", "_invocation(" in source)
+
+
+def test_memory_isolation_is_enforced_in_sql() -> None:
+    list_sql = inspect.getsource(mcp_server.list_memories)
+    check("global rows use the shared sentinel owner", "GLOBAL_OWNER" in inspect.getsource(mcp_server))
+    check("private reads filter by the requester", "owner = $2" in list_sql and "_requester()" in list_sql)
+    delete_sql = inspect.getsource(mcp_server.delete_memory)
+    check("delete only touches the owner's private rows", "scope = 'private'" in delete_sql and "owner = $2" in delete_sql)
+    check("global memories are never deletable", "never deletable" in inspect.getsource(mcp_server.delete_memory))
+    check("the requester fails closed without a configured identity",
+          "unconfigured-user" in inspect.getsource(mcp_server._requester))
+
+
+def test_memory_promotion_carries_the_three_gates() -> None:
+    promote = inspect.getsource(mcp_server.promote_memory)
+    check("gate 1: verification must be recorded", not promote or "verification is required" in promote)
+    check("gate 2: project-specific lessons are refused", "project_specific" in promote)
+    check("gate 3: sanitization is checked", "_assert_sanitizable" in promote)
+    sanitizer = inspect.getsource(mcp_server._assert_sanitizable)
+    check("sanitizer refuses embedded identity", "requester.lower() in body.lower()" in sanitizer)
+    check("sanitizer refuses credential-shaped text", "_SECRET_MARKERS" in sanitizer)
+    check("promotion writes provenance", "promoted_from" in promote and "sanitized_by_gate" in promote)
+    schema = Path("setup_neon.py").read_text(encoding="utf-8")
+    check("the memories table exists with a scope check", "scope        TEXT NOT NULL CHECK" in schema)
+    check("global promotion only comes through the tool", "'global'" in promote)
+    worker_source = inspect.getsource(worker)
+    check("worker requires approval for promotion",
+          '"promote_memory": "always"' in worker_source)
+    check("worker passes the user identity to the server", "FRONTEND_USER_ID" in worker_source)
+
+
 def main() -> int:
     test_guardrail_blocks_unsafe_input()
     test_guardrail_allows_real_work()
@@ -813,6 +862,9 @@ def main() -> int:
     test_decisions_record_who_decided()
     test_skills_compose_via_filesystem_handoff()
     test_replay_reports_cost_rollups()
+    test_memory_tools_are_registered()
+    test_memory_isolation_is_enforced_in_sql()
+    test_memory_promotion_carries_the_three_gates()
 
     print(f"\n{'ALL OFFLINE CHECKS PASSED' if not FAILURES else f'{len(FAILURES)} FAILED: {FAILURES}'}")
     return 1 if FAILURES else 0

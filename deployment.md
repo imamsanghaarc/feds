@@ -22,6 +22,12 @@ Design notes:
 
 - Dependencies are installed before source is copied, so code edits do not
   invalidate the dependency layer.
+- `.dockerignore` excludes root-level markdown (design docs stay out of the
+  image) but explicitly re-includes `SYSTEM_PROMPT.md`: the worker reads it at
+  startup and would otherwise silently run with a one-line fallback identity.
+  The skill corpus in `.claude/skills/` is nested, so the root-level `*.md`
+  rule does not exclude it and the skills ship with the image. A regression
+  test pins the `!SYSTEM_PROMPT.md` exception.
 - `init: true` gives the worker proper signal handling and child reaping, which
   matters because it spawns the MCP server as a subprocess.
 - The healthcheck only verifies database reachability, which is the single

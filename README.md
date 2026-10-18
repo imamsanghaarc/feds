@@ -84,6 +84,11 @@ On a Unix-like host the SDK's sandbox `Skills` capability loads skills lazily. O
 Windows that capability is unavailable, so FEDS uses an equivalent skill index
 plus a `load_skill` tool.
 
+All 35 skills live in `.claude/skills/`, the standard location Claude Code,
+OpenCode, and the sandbox SDK all read. `_resolve_skills_root()` prefers that
+path and falls back to `skills/`, so neither loader can disagree about where
+the corpus is.
+
 Either way only the skill a task actually needs is read:
 
 | | Characters |

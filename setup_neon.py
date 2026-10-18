@@ -97,6 +97,26 @@ CREATE TABLE IF NOT EXISTS capability_invocations (
 CREATE INDEX IF NOT EXISTS idx_cap_conv
     ON capability_invocations(conversation_id, created_at);
 
+-- Section 6a: private per-user memory and the shared global layer.
+-- Private rows are owned by one user id (the isolation boundary).
+-- Global rows are only ever created by promote_memory and use owner = '-'
+-- as the shared sentinel; their metadata carries promotion provenance.
+CREATE TABLE IF NOT EXISTS memories (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    scope        TEXT NOT NULL CHECK (scope IN ('private', 'global')),
+    owner        TEXT NOT NULL,
+    body         TEXT NOT NULL,
+    metadata     JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status       TEXT NOT NULL DEFAULT 'active'
+                 CHECK (status IN ('active', 'promoted', 'superseded')),
+    verification TEXT,
+    promoted_by  TEXT,
+    promoted_at  TIMESTAMPTZ,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_memories_scope_owner
+    ON memories(scope, owner, created_at);
+
 -- Added when operator attribution landed: who approved or rejected each run.
 -- `IF NOT EXISTS` keeps the statement safe on a database that already has it.
 ALTER TABLE run_states ADD COLUMN IF NOT EXISTS operator TEXT;

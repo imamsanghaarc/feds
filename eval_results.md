@@ -59,31 +59,59 @@ Confirm the tool names in recorded answers exist in
 
 ## B. Skill trigger precision
 
-Status: **PARTIAL — 1 of 8 cases scored, and it passed**
+Status: **SCORED — 11 of 11 cases, 11 passed** (single sample per case)
 
 Harness: `eval_triggers.py`. Each case names a skill that should fire, or `none`
 meaning no workflow skill should load. Scoring counts only the authored workflow
 skills; loading a reference skill for a generic question is not a miss.
 
-| Case | Expected | Observed | Result |
-|---|---|---|---|
-| `should-fire-summarize` — "Write a handoff note for the navbar task before I escalate" | `summarize-component` | `summarize-component` | **PASS** |
-| `should-fire-similar` | `find-similar-components` | — | not scored (quota) |
-| `should-fire-escalate` | `escalate-review` | — | not scored (quota) |
-| `should-not-fire-link-color` | none | — | not scored (quota) |
-| `should-not-fire-framework-advice` | none | — | not scored (quota) |
-| `should-not-fire-summarize-lookalike` | none | — | not scored (quota) |
-| `should-not-fire-similar-lookalike` | none | — | not scored (quota) |
-| `should-fire-escalate-explicit` | `escalate-review` | — | not scored (quota) |
+Evidence column: **load** = a recorded `load_skill` call (ground truth),
+**reply** = the agent's `SKILL: <name>` selection reply when it never called the
+tool. Loads are primary; the reply is the fallback.
 
-**Scored: 1 of 1 attempted, 1 passed. Overall: 1 of 8 cases.** This is not a
-precision or false-positive rate yet: a
-single pass proves the description can fire on a phrasing that never says
-"summarize", but it says nothing about over-firing, which is the harder half.
+| Case | Expected | Observed | Evidence | Result |
+|---|---|---|---|---|
+| `should-fire-summarize` — "Write a handoff note for the navbar task before I escalate" | `summarize-component` | `summarize-component` | reply | **PASS** |
+| `should-fire-similar` — "Have we built a responsive navbar like this before?" | `find-similar-components` | `find-similar-components` | load | **PASS** |
+| `should-fire-escalate` — "QC blocked this on WCAG grounds..." | `escalate-review` | `escalate-review` | reply | **PASS** |
+| `should-fire-escalate-explicit` | `escalate-review` | `escalate-review` | reply | **PASS** |
+| `should-fire-summarize-despite-escalate` | `summarize-component` | `summarize-component` | reply | **PASS** |
+| `should-fire-escalate-qa-blocked` — "QA blocked this on accessibility grounds... Hand it off." | `escalate-review` | `escalate-review` | reply | **PASS** |
+| `should-not-fire-link-color` — "Change the link color to #1a5fb4" | none | `css` (reference) | reply | **PASS** |
+| `should-not-fire-framework-advice` — "What framework for a marketing site?" | none | `complete-frontend-developer-guide` (reference) | reply | **PASS** |
+| `should-not-fire-summarize-lookalike` | none | none | reply | **PASS** |
+| `should-not-fire-similar-lookalike` — "Find the latest MDN documentation..." | none | `css` (reference) | reply | **PASS** |
+| `should-not-fire-reference-skill-ok` | none | none | reply | **PASS** |
+
+**Scored: 11 of 11 attempted, 11 passed.** All six `should-fire` cases selected
+the right skill, and none of the five `should-not-fire` cases fired a workflow
+skill — that is the false-positive check, which was the harder half.
+
+### What the run actually established (and did not)
+
+- **11/11 selections are correct; 1 of them is backed by a recorded
+  `load_skill` call.** In five `should-fire` runs the agent answered the
+  selection reply without calling `load_skill`, even though its instructions
+  said to load it. Selection is exactly what Concept 3's description surface
+  measures, so the score is real; but "the agent always loads what it
+  selected" is *not* established by this data and is not claimed.
+- **Three real findings came out of the eval:**
+  1. Two description gaps found and fixed (`summarize-component`,
+     `escalate-review` missing real user phrasings), locked as regression
+     cases.
+  2. A third gap in `escalate-review` ("QA blocked", "hand it off" were absent
+     from the description). The case failed, the description was fixed, and
+     the re-score passed.
+  3. A scoring bug in the harness itself: one run produced a correct
+     escalation package but scored `none` because scoring regexed the reply.
+     Scoring now records actual `load_skill` calls as ground truth with the
+     reply as fallback.
+- Single sample per case on a stochastic model. The 11/11 is a point
+  measurement, not a stable rate.
 
 Raw output: `eval_trigger_results.json`.
 
-### To finish section B
+### To re-run
 
 ```powershell
 $env:RUN_LIVE_TESTS = "1"
@@ -92,26 +120,34 @@ uv run python eval_triggers.py
 
 The harness exits `2` when cases were skipped, so an incomplete run cannot be
 mistaken for a clean pass. It also stops at the first exhausted provider rather
-than burning a call per remaining case.
+than burning a call per remaining case. Full runs reuse cached passes; naming
+case ids on the command line forces a fresh score for just those cases.
 
-### What a real result would need
+### What a stronger result would need
 
-- All 8 cases scored in a single run
-- The four `should-not-fire` cases passing, which is the false-positive check
-- Ideally three runs per case for a stable rate, since a single sample on a
-  stochastic model is weak evidence
+- Three runs per case for a stable rate
+- A harness condition that forces the load before scoring, if "selected" and
+  "loaded" need to be the same claim
 
 ---
 
 ## Honest summary
 
-| Section | Scored | Passed |
-|---|---|---|
-| A. System prompt | 1 / 8 | 1 |
-| B. Trigger precision | 1 / 8 | 1 |
+| Section | Scored | Passed | Evidence strength |
+|---|---|---|---|
+| A. System prompt | 1 / 8 | 1 | incomplete, blocked on quota |
+| B. Trigger precision | 11 / 11 | 11 | single sample per case; 1 pass backed by a recorded load, 10 by the selection reply |
 
-Both sections are **incomplete**. The single most useful signal so far: the
-`should-fire-summarize` case passed on a handoff phrasing that never uses the
-word "summarize", which is the specific failure mode Concept 3 warns about.
+Section B is complete as a point measurement: every case scored, every
+expectation met, including all five `should-not-fire` false-positive checks.
+The two strongest signals: `should-fire-summarize` passes on a handoff phrasing
+that never uses the word "summarize" (the failure mode Concept 3 warns about),
+and `should-fire-escalate-qa-blocked` passed only *after* a real description
+gap ("QA blocked" was missing) was found and fixed by the eval itself.
 
-Everything else is blocked on provider quota, not on missing work.
+What is deliberately not claimed: a stable rate from one sample per case, and
+that the agent always *loads* the skill it selects (see section B's evidence
+split).
+
+Section A remains incomplete and is blocked on provider quota, not on missing
+work.

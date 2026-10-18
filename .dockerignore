@@ -8,3 +8,7 @@ __pycache__
 !.env.example
 *.md
 !README.md
+# The worker reads SYSTEM_PROMPT.md at startup and would silently fall back to
+# a one-line identity without it; the skill corpus under .claude/skills/ is
+# nested, so the root-level *.md rule does not touch it.
+!SYSTEM_PROMPT.md

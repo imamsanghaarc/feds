@@ -9,6 +9,7 @@ import re
 import sys
 import time
 import urllib.request
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
@@ -802,6 +803,279 @@ async def publish_task(name: str, target: str = "staging") -> dict[str, Any]:
                 )
 
         return {"published": True, "document_id": document_id, "name": name, "target": target}
+
+
+# --- Memory (section 6a): private per-user memory plus the shared global layer.
+
+GLOBAL_OWNER = "-"
+"""Sentinel owner for global rows. They are readable by everyone, writable by
+promotion only, and never deletable: the shared corpus must stay auditable."""
+
+
+def _requester() -> str:
+    """The user this MCP process serves; the isolation boundary.
+    The worker injects `FRONTEND_USER_ID` alongside the conversation id, so a
+    misconfigured deployment fails closed to one clearly-named identity instead
+    of silently sharing everything."""
+    return os.getenv("FRONTEND_USER_ID") or "unconfigured-user"
+
+
+_SECRET_MARKERS = re.compile(
+    r"(api[_-]?key|token|password|secret|bearer)\s*[=:]\s*\S", re.I
+)
+
+
+def _assert_sanitizable(body: str, requester: str) -> None:
+    """Reject a promotion past the sanitized gate before humans touch it.
+
+    Automated gates can only catch the obvious: the author's own identity
+    embedded in the text, or a credential-shaped assignment. Everything else is
+    the human approver's judgement, enforced by the approval gate on the tool.
+    """
+    if requester and requester.lower() in body.lower():
+        raise PermissionError(
+            "memory contains the author's identity; sanitize it before promoting"
+        )
+    if _SECRET_MARKERS.search(body):
+        raise PermissionError(
+            "memory looks like it carries a credential; sanitize it before promoting"
+        )
+
+
+@mcp.tool()
+async def save_memory(body: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Save one lesson, preference, or correction as private memory for this user."""
+    body = body.strip()
+    if not body:
+        raise ValueError("body is required")
+    if len(body) > 4000:
+        raise ValueError("body must stay under 4000 characters; split it into lessons")
+    metadata = dict(metadata or {})
+
+    async with _invocation("save_memory", {"body_len": len(body)}):
+        pool = await _pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                memory_id = await conn.fetchval(
+                    """
+                    INSERT INTO memories (scope, owner, body, metadata)
+                    VALUES ('private', $1, $2, $3::jsonb)
+                    RETURNING id
+                    """,
+                    _requester(),
+                    body,
+                    json.dumps(metadata),
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO audit_log
+                        (conversation_id, actor, action, target, payload, result)
+                    VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb)
+                    """,
+                    _conversation_id(),
+                    "mcp:frontend-workspace",
+                    "capability_invoked",
+                    "memories",
+                    json.dumps({"tool": "save_memory", "scope": "private"}),
+                    json.dumps({"memory_id": str(memory_id)}),
+                )
+        return {"saved": True, "memory_id": str(memory_id), "scope": "private"}
+
+
+@mcp.tool()
+async def list_memories(limit: int = 25) -> dict[str, Any]:
+    """List this user's private memories and the shared global layer.
+
+    Isolation lives in the SQL: a private row is only returned when its owner
+    matches this requester, so another user's lessons can never be read here.
+    """
+    limit = max(1, min(int(limit), 100))
+    async with _invocation("list_memories", {"limit": limit}):
+        pool = await _pool()
+        rows = await pool.fetch(
+            """
+            SELECT id, scope, owner, body, metadata, status, verification, created_at
+            FROM memories
+            WHERE (scope = 'global' AND owner = $1)
+               OR (scope = 'private' AND owner = $2)
+            ORDER BY created_at DESC
+            LIMIT $3
+            """,
+            GLOBAL_OWNER,
+            _requester(),
+            limit,
+        )
+        return {
+            "requester": _requester(),
+            "count": len(rows),
+            "memories": [
+                {
+                    "id": str(row["id"]),
+                    "scope": row["scope"],
+                    "body": row["body"],
+                    "metadata": _as_dict(row["metadata"]),
+                    "status": row["status"],
+                    "verification": row["verification"],
+                }
+                for row in rows
+            ],
+        }
+
+
+@mcp.tool()
+async def delete_memory(memory_id: str) -> dict[str, Any]:
+    """Delete one of this user's active private memories.
+
+    Promoted rows are kept: the global copy references them as provenance, so
+    removing the origin would break the chain. Global rows are never deletable.
+    """
+    memory_id = memory_id.strip()
+    async with _invocation("delete_memory", {"memory_id": memory_id}):
+        pool = await _pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    DELETE FROM memories
+                    WHERE id = $1
+                      AND scope = 'private'
+                      AND owner = $2
+                      AND status = 'active'
+                    RETURNING id
+                    """,
+                    uuid.UUID(memory_id) if memory_id else uuid.UUID(int=0),
+                    _requester(),
+                )
+                if row is None:
+                    raise PermissionError(
+                        "memory not found among this user's active private "
+                        "memories; global and promoted rows are never deletable"
+                    )
+                await conn.execute(
+                    """
+                    INSERT INTO audit_log
+                        (conversation_id, actor, action, target, payload, result)
+                    VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb)
+                    """,
+                    _conversation_id(),
+                    "mcp:frontend-workspace",
+                    "capability_invoked",
+                    "memories",
+                    json.dumps({"tool": "delete_memory", "memory_id": memory_id}),
+                    json.dumps({"deleted": True}),
+                )
+        return {"deleted": True, "memory_id": memory_id}
+
+
+@mcp.tool(
+    annotations={"read_only_hint": False, "destructive_hint": False, "idempotent_hint": False}
+)
+async def promote_memory(memory_id: str, verification: str) -> dict[str, Any]:
+    """Promote one private memory to the shared global layer.
+
+    Like `publish_task`, this is the human-gated write: it pauses for approval
+    before anything shared is created. All three gates must hold:
+
+    1. verified - recorded by the `verification` argument (a reviewer's name,
+       an eval id, or an automated check), not merely asserted;
+    2. generalizable - refused when the author flagged the lesson
+       `project_specific`;
+    3. sanitized - identity and credential-shaped text is refused outright.
+
+    Needs `FRONTEND_USER_ID`-independent human attribution, which the approval
+    operator supplies when resuming.
+    """
+    memory_id = memory_id.strip()
+    verification = verification.strip()
+    if not verification:
+        raise ValueError(
+            "verification is required: record who or what verified this lesson"
+        )
+
+    async with _invocation(
+        "promote_memory", {"memory_id": memory_id, "verified_by": verification}
+    ):
+        pool = await _pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT id, scope, owner, body, metadata, status
+                    FROM memories
+                    WHERE id = $1
+                      AND scope = 'private'
+                      AND owner = $2
+                      AND status = 'active'
+                      FOR UPDATE
+                    """,
+                    uuid.UUID(memory_id) if memory_id else uuid.UUID(int=0),
+                    _requester(),
+                )
+                if row is None:
+                    raise PermissionError(
+                        "active private memory not found for this user; "
+                        "nothing was promoted"
+                    )
+                metadata = _as_dict(row["metadata"])
+                if metadata.get("project_specific"):
+                    raise PermissionError(
+                        "memory is marked project_specific; generalizable lessons only"
+                    )
+                _assert_sanitizable(row["body"], _requester())
+
+                provenance = {
+                    "promoted_from": str(row["id"]),
+                    "promoted_by": os.getenv("MEMORY_PROMOTED_BY") or _requester(),
+                    "verification": verification,
+                    "sanitized_by_gate": True,
+                }
+                await conn.execute(
+                    """
+                    UPDATE memories
+                    SET status = 'promoted', verification = $2, promoted_by = $3,
+                        promoted_at = now()
+                    WHERE id = $1
+                    """,
+                    row["id"],
+                    verification,
+                    provenance["promoted_by"],
+                )
+                global_id = await conn.fetchval(
+                    """
+                    INSERT INTO memories
+                        (scope, owner, body, metadata, verification)
+                    VALUES ('global', $1, $2, $3::jsonb, $4)
+                    RETURNING id
+                    """,
+                    GLOBAL_OWNER,
+                    row["body"],
+                    json.dumps(provenance),
+                    verification,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO audit_log
+                        (conversation_id, actor, action, target, payload, result)
+                    VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb)
+                    """,
+                    _conversation_id(),
+                    "mcp:frontend-workspace",
+                    "capability_invoked",
+                    "memories",
+                    json.dumps(
+                        {
+                            "tool": "promote_memory",
+                            "memory_id": memory_id,
+                            "verified_by": verification,
+                        }
+                    ),
+                    json.dumps({"global_id": str(global_id)}),
+                )
+        return {
+            "promoted": True,
+            "global_id": str(global_id),
+            "verification": verification,
+        }
 
 
 def main() -> None:

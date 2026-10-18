@@ -674,15 +674,20 @@ def _mcp_server(conversation_id: str | None) -> MCPServerStdio:
                 # Lets the MCP server attribute audit and capability rows to
                 # this conversation instead of writing orphaned NULL rows.
                 "FRONTEND_CONVERSATION_ID": conversation_id or "",
+                # Section 6a: the memory isolation boundary. Without a real
+                # identity every memory owner is "unconfigured-user", which
+                # fails visible rather than sharing everything.
+                "FRONTEND_USER_ID": os.getenv("FEDS_USER_ID", "unconfigured-user"),
             },
         ),
         name="frontend-workspace",
         cache_tools_list=True,
         client_session_timeout_seconds=20,
-        # Decision 9: gate the one dangerous tool and leave the reads free.
-        # `publish_task` is the only tool that promotes a task, so it is the
-        # only one that pauses for a human.
-        require_approval={"publish_task": "always"},
+        # Decision 9: gate the two promotion writes and leave the reads free.
+        # `publish_task` promotes frontend tasks and `promote_memory` promotes
+        # private lessons into the shared layer; both are the only paths to a
+        # promotion, so both pause for a human.
+        require_approval={"publish_task": "always", "promote_memory": "always"},
     )
 
 
@@ -731,7 +736,11 @@ def build_agent():
             "contents from its description alone. "
             "For persistent frontend records, use only the frontend-workspace MCP tools: "
             "lookup_task, list_tasks, find_similar_tasks, save_task, record_review, "
-            "publish_task. Never generate or request broad SQL. If no skill matches the "
+            "publish_task. For lessons the user wants remembered, use the memory tools: "
+            "save_memory stores a private lesson, list_memories reads this user's "
+            "lessons plus the verified shared layer, and promote_memory is "
+            "human-gated so it pauses for approval. Never generate or request broad SQL. "
+            "If no skill matches the "
             "request, respond as follows: "
             + NO_SKILL_MATCHED
             + "\n\n--- SKILL INDEX (name: description) ---\n"

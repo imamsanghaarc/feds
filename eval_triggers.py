@@ -7,9 +7,11 @@ rate are the numbers that matter.
 Method
 ------
 Each case names a skill that SHOULD fire or SHOULD stay quiet. For each case the
-agent is given the skill index and asked to pick a skill and load it. A run
-passes when the expected skill was loaded (should-fire) or when no workflow skill
-was loaded (should-not-fire).
+agent is given the skill index and asked to pick a skill and load it. Passes are
+judged from the `load_skill` calls the agent actually made - the behavior, not
+its self-report - with the agent's "SKILL: <name>" reply kept only as the
+fallback when nothing was loaded. A run passes when the expected skill was
+loaded (should-fire) or when no workflow skill was loaded (should-not-fire).
 
 Only the 5 authored workflow skills count as "a skill fired"; the language and
 framework skills are reference material, and loading `frontend-development` for
@@ -28,6 +30,7 @@ import sys
 
 import worker
 from agents import Runner
+from agents.tool import FunctionTool
 
 # Cases mirror eval_set.md, expressed against FEDS's own skills.
 # expect: a skill name, or None meaning "no workflow skill should load".
@@ -111,8 +114,32 @@ WORKFLOW_SKILLS = {
 LOAD_RE = re.compile(r"load(?:ed|ing)?(?:_skill)?[:\s\"']*([a-z0-9\-]+)", re.I)
 
 
+def _recording_load_skill(recorder):
+    """Wrap worker.load_skill with a call recorder that keeps delivery intact."""
+    inner = worker.load_skill
+
+    async def on_invoke(tool_context, input_json):
+        try:
+            args = json.loads(input_json)
+            name = str(args.get("name") or "").strip().lower()
+            if name:
+                recorder.loaded.append(name)
+        except (TypeError, ValueError):
+            pass
+        return await inner.on_invoke_tool(tool_context, input_json)
+
+    return FunctionTool(
+        name=inner.name,
+        description=inner.description,
+        params_json_schema=dict(inner.params_json_schema),
+        on_invoke_tool=on_invoke,
+        strict_json_schema=inner.strict_json_schema,
+    )
+
+
 def build_trigger_agent():
     """An agent whose only job is to pick a skill and load it."""
+    recorder = _SkillLoadRecorder()
     agent, _ = worker.build_agent()
     agent.instructions = (
         "You select exactly one skill for the request, then load it.\n\n"
@@ -122,28 +149,59 @@ def build_trigger_agent():
         "SKILL: none\n\n"
         f"Available skills:\n{worker._skill_index()}\n"
     )
-    return agent
+    recorder_tool = _recording_load_skill(recorder)
+    try:
+        replaced = False
+        tools = list(getattr(agent, "tools", None) or [])
+        for index, tool in enumerate(tools):
+            if getattr(tool, "name", "") == "load_skill":
+                tools[index] = recorder_tool
+                replaced = True
+                break
+        if not replaced:
+            tools.append(recorder_tool)
+        agent.tools = tools
+    except (AttributeError, TypeError):
+        # If the tool surface is not re-settable, fall back to reply scoring;
+        # do not let instrumentation break the run.
+        return agent, None
+    return agent, recorder
+
+
+class _SkillLoadRecorder:
+    """Collects the skill names actually handed to load_skill during one run."""
+
+    def __init__(self) -> None:
+        self.loaded: list[str] = []
 
 
 async def run_case(case: dict[str, object]) -> dict[str, object]:
-    agent = build_trigger_agent()
+    agent, recorder = build_trigger_agent()
     try:
         result = await Runner.run(agent, str(case["prompt"]))
         output = str(result.final_output or "")
     except Exception as exc:  # noqa: BLE001
         return {**case, "error": f"{type(exc).__name__}: {exc}"}
 
-    match = re.search(r"SKILL:\s*([a-z0-9\-]+)", output, re.I)
-    chosen = (match.group(1) if match else "").strip().lower()
-    if chosen in {"none", "no", ""}:
-        chosen = None
+    # Ground truth: which workflow skills the run actually loaded.
+    loaded_workflow = sorted(
+        {str(name) for name in getattr(recorder, "loaded", []) if str(name) in WORKFLOW_SKILLS}
+    )
 
-    # Fall back to scanning for a skill that was actually loaded.
-    if chosen is None:
-        for candidate in WORKFLOW_SKILLS:
-            if re.search(rf"\b{re.escape(candidate)}\b", output, re.I):
-                chosen = candidate
-                break
+    reply_match = re.search(r"SKILL:\s*([a-z0-9\-]+)", output, re.I)
+    reply = reply_match.group(1).strip().lower() if reply_match else ""
+    if reply in {"none", "no", ""}:
+        reply_name = None
+    else:
+        reply_name = reply
+
+    if len(loaded_workflow) > 1:
+        chosen = "ambiguous:" + ", ".join(loaded_workflow)
+    elif len(loaded_workflow) == 1:
+        # The behavior is the truth even when the agent forgets the reply format.
+        chosen = loaded_workflow[0]
+    else:
+        chosen = reply_name
 
     expected = case["expect"]
     if expected is None:
@@ -159,7 +217,13 @@ async def run_case(case: dict[str, object]) -> dict[str, object]:
         passed = chosen == expected
         observed = chosen or "none"
 
-    return {**case, "chosen": observed, "passed": passed, "raw": output[:200]}
+    return {
+        **case,
+        "chosen": observed,
+        "loaded": loaded_workflow,
+        "passed": passed,
+        "raw": output[:200],
+    }
 
 
 RESULTS_PATH = "eval_trigger_results.json"
@@ -203,7 +267,9 @@ async def main() -> int:
             continue
 
         prior = previous.get(case_id)
-        if prior and "error" not in prior and not os.getenv("RETRY_ALL"):
+        # Full runs reuse cached passes so resuming costs nothing; naming cases
+        # explicitly means the operator asked for a fresh score right now.
+        if prior and "error" not in prior and not os.getenv("RETRY_ALL") and not only:
             print(f"[CACHED] {case_id:34s} {prior.get('chosen')}")
             continue
 
