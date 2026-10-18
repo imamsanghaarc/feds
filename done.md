@@ -85,8 +85,10 @@ Scoped tools over Neon, the agent's entire database surface:
   parked run cannot interleave writes — the second caller is refused
   immediately.
 - **Proven live:** a real pause wrote nothing while parked and published
-  only after approval (`test_approval_gate.py`, RUN_LIVE_TESTS=1), and a
-  refused publish is audited as a refusal, not a silent success.
+  only after approval (`test_approval_gate.py`, RUN_LIVE_TESTS=1); a refused
+  publish is audited as a refusal, not a silent success; and the operator
+  refusal path is exercised live in `smoke_operator_auth.py` (8/8: decision
+  refused, parked run untouched, refusal on the trail) with zero model quota.
 
 ## 5. Memory architecture (private per-user + shared global)
 
@@ -102,8 +104,9 @@ Scoped tools over Neon, the agent's entire database surface:
   provenance (origin id, promoter, verification); promoted originals are
   kept as the provenance chain and can never promote twice.
 - **Proven live:** `smoke_memory.py` (zero quota) shows cross-user reads
-  refused, all four gates firing, one real generalizable lesson promoted
-  and read by the other user, and clean teardown.
+  refused, all three gates firing plus both sanitizer refusals, one real
+  generalizable lesson promoted and read by the other user, and clean
+  teardown.
 
 ## 6. Semantic search and embeddings (pgvector)
 
@@ -123,7 +126,9 @@ Scoped tools over Neon, the agent's entire database surface:
   humanized file name; the embedding input carries the title and any
   frontmatter `context`, while the stored chunk stays the raw body. Dry-run
   by default, idempotent per (source, title), and a file that fails to embed
-  writes nothing, so a partial run is retryable.
+  writes nothing, so a partial run is retryable. Proven live by
+  `smoke_ingest.py` (11/11 with real embeddings; the second run correctly
+  reports nothing to do).
 - **Seed corpus (14 cases).** `seed_corpus.py` ships hand-authored
   resolved cases including deliberate confusable pairs (two navbars, two
   buttons, two forms, two galleries, two tables); `verify_corpus.py`
@@ -145,11 +150,16 @@ Scoped tools over Neon, the agent's entire database surface:
 
 ## 8. Observability, sessions, and cost
 
-- **Complete audit trail.** A closed audit vocabulary
-  (`message_received`, `skill_activated`, `capability_invoked`,
-  `guardrail_tripped`, `message_sent`, `approval_decided`, ...) written by
-  both the worker and the MCP server; `replay.py` reconstructs a whole
-  conversation from `audit_log` alone.
+- **Complete audit trail.** A closed audit vocabulary in which the schema's
+  CHECK constraint is the source of truth for actions (`message_received`,
+  `skill_activated`, `capability_invoked`, `message_sent`,
+  `guardrail_tripped`, `refund_issued`, `refund_blocked`, `corpus_seeded`),
+  with decision events (`approval_decided`, `approval_refused`,
+  `approval_pending`, `started`, `completed`) carried inside payloads. A test
+  reads the real write sites and the constraint, so the worker cannot emit a
+  verb the database would reject. Written by both the worker and the MCP
+  server; `replay.py` reconstructs a whole conversation from `audit_log`
+  alone.
 - **Token and cost rollups.** Every turn records one `chat.turn` capability
   row with aggregate tokens, serving provider, and an estimated
   `cost_cents` (labelled `cost_basis: list_price_estimate`). Unknown
@@ -189,8 +199,17 @@ Scoped tools over Neon, the agent's entire database surface:
   resilience, and secret hardening. Reviewed but not yet executed — Docker
   was unavailable here.
 - **Schema as code.** `setup_neon.py` applies the full idempotent schema
-  (documents, embeddings, memories, audit log, capability metrics, run
-  states, sessions) and verifies it after every run.
+  (conversations, documents, embeddings, audit log, capability metrics,
+  memories, run states, sessions) and verifies it after every run. The
+  approval table (`run_states`: status CHECK, conversation FK, operator
+  column) is created here — it previously existed only in databases where it
+  had been made by hand, so a fresh deployment could not park an approval at
+  all.
+- **Zero-quota live proofs.** `smoke_mcp.py` (MCP tools directly),
+  `smoke_memory.py` (memory isolation and gates), `smoke_operator_auth.py`
+  (the refusal path and its audit row) and `smoke_ingest.py` (ingestion and
+  idempotency) exercise real Neon behavior without spending model quota, so
+  they keep working when providers are exhausted.
 - **Founder work queues.** `done.md` (this file), `missing.md` (remaining
   work, Sanghaar), `muheeb.md` (features, Muheeb), and `plan.md` (the ten
   design decisions) keep ownership and status explicit.
