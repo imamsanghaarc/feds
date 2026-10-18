@@ -201,6 +201,7 @@ def _local_skill_text() -> str:
 from config import (  # noqa: E402
     AGENT_NAME,
     CHAT_MODELS,
+    DEFAULT_OPERATOR,
     GEMINI_API_KEY,
     GEMINI_BASE_URL,
     GEMINI_CHAT_MODEL,
@@ -211,6 +212,7 @@ from config import (  # noqa: E402
     PROVIDER_COOLDOWN_SECONDS,
     chat_order,
     cost_cents_for,
+    operator_authorized,
 )
 
 # Legacy names kept so the rest of this module reads naturally.
@@ -958,11 +960,14 @@ async def run_task(user_input: str) -> None:
         await engine.dispose()
         _CURRENT_CONVERSATION_ID = None
 
-async def decide_run(run_id: str, decision: str, operator: str = "operator-local") -> None:
+async def decide_run(run_id: str, decision: str, operator: str = DEFAULT_OPERATOR) -> bool:
+    """Apply one human decision to a parked run. Returns True when the decision
+    was recorded; refusal or failure returns False so callers (CLI, console)
+    can exit non-zero instead of pretending success."""
     decision = decision.lower()
     if decision not in {"approve", "approved", "reject", "rejected"}:
         print("Decision must be 'approve' or 'reject'.")
-        return
+        return False
 
     engine_url = NEON_DATABASE_URL.split("?", 1)[0].replace("postgresql://", "postgresql+asyncpg://", 1)
     engine = create_async_engine(
@@ -984,10 +989,35 @@ async def decide_run(run_id: str, decision: str, operator: str = "operator-local
             ).mappings().first()
         if row is None:
             print(f"Approval run not found: {run_id}")
-            return
+            return False
+        # Who MAY decide, not who did: attribution is worthless if any caller
+        # can stamp any name on a decision. Checked before the status look so
+        # an unauthorized operator cannot even probe a run's state, and the
+        # attempt itself lands on the trail.
+        if not operator_authorized(operator):
+            if conversation_id := row["conversation_id"]:
+                await asyncio.to_thread(
+                    _write_audit_row,
+                    conversation_id,
+                    "capability_invoked",
+                    row["tool_name"] or "publish_task",
+                    {
+                        "run_id": run_id,
+                        "event": "approval_refused",
+                        "operator": operator,
+                        "reason": "operator not in FEDS_ALLOWED_OPERATORS",
+                    },
+                    {"status": "refused"},
+                )
+            print(
+                f"Operator {operator!r} is not authorized to decide runs. "
+                "Set FEDS_ALLOWED_OPERATORS (comma-separated names) to grant "
+                "access; with no list configured only 'operator-local' may decide."
+            )
+            return False
         if row["status"] not in {"awaiting", "approved", "rejected"}:
             print(f"Approval run already has status: {row['status']}")
-            return
+            return False
 
         conversation_id = row["conversation_id"]
         # Decision 10: two operators deciding the same parked run at once both
@@ -1000,7 +1030,7 @@ async def decide_run(run_id: str, decision: str, operator: str = "operator-local
                     "Another operation is running on that conversation; "
                     "retry after it finishes."
                 )
-                return
+                return False
             # RunState.from_string is async in this SDK version; calling it
             # synchronously returns a coroutine and the resume dies later with a
             # confusing 'coroutine has no attribute' error.
@@ -1009,7 +1039,7 @@ async def decide_run(run_id: str, decision: str, operator: str = "operator-local
             interrupts = state.get_interruptions()
             if not interrupts:
                 print("No pending approval remains for that run state.")
-                return
+                return False
 
             for item in interrupts:
                 if decision in {"approve", "approved"}:
@@ -1058,7 +1088,7 @@ async def decide_run(run_id: str, decision: str, operator: str = "operator-local
                         },
                     )
                 print(f"Approval processed but another pause remains: run_id={new_run_id}")
-                return
+                return True
 
             final_output = str(result.final_output).strip() if result.final_output is not None else ""
             decided_status = "resumed" if decision in {"approve", "approved"} else "rejected"
@@ -1084,13 +1114,21 @@ async def decide_run(run_id: str, decision: str, operator: str = "operator-local
                 print(NO_OUTPUT)
             else:
                 print(final_output)
+            return True
     except Exception as exc:
         print(SKILL_FAILURE.format(error=exc))
+        return False
     finally:
         await engine.dispose()
 
 
-async def main() -> None:
+async def main() -> int | None:
+    """Run one agent turn, or apply one --decide.
+
+    --decide paths return a real exit code (0 recorded, 1 refused or failed,
+    2 usage error) so an operator's shell or a future console cannot mistake
+    an unauthorized refusal for success. The chat path returns None (exit 0).
+    """
     args = sys.argv[1:]
     if args and args[0] == "--decide":
         # Usage: --decide <run_id> approve [operator]
@@ -1100,10 +1138,9 @@ async def main() -> None:
             or args[2] not in {"approve", "approved", "reject", "rejected"}
         ):
             print("Usage: uv run python worker.py --decide <run_id> approve [operator]")
-            return
-        operator = args[3] if len(args) == 4 else "operator-local"
-        await decide_run(args[1], args[2], operator)
-        return
+            return 2
+        operator = args[3] if len(args) == 4 else DEFAULT_OPERATOR
+        return 0 if await decide_run(args[1], args[2], operator) else 1
 
     user_input = " ".join(args) if args else ""
     if not user_input:
@@ -1126,4 +1163,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()) or 0)

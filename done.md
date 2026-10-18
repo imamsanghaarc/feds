@@ -74,6 +74,12 @@ Scoped tools over Neon, the agent's entire database surface:
 - **Operator attribution.** Every decision records who made it:
   `run_states.operator` plus an `approval_decided` audit row. Default is
   `operator-local`; real decisions pass a name.
+- **Operator authorization.** `FEDS_ALLOWED_OPERATORS` decides *who may*
+  decide, not just who did: unset keeps single-operator local mode (only
+  `operator-local`), a configured list is enforced case-insensitively, and an
+  unauthorized attempt is refused before the run is touched, written to the
+  trail as `approval_refused`, and exits non-zero. `decide_run` now returns a
+  real success/failure boolean instead of optimistically returning nothing.
 - **Per-conversation advisory lock.** `decide_run` holds a Postgres
   advisory lock for the whole resume, so two operators deciding the same
   parked run cannot interleave writes — the second caller is refused
@@ -110,6 +116,14 @@ Scoped tools over Neon, the agent's entire database surface:
 - **Migration tooling.** `reembed.py --dry-run/--apply/--dedupe/
   --purge-orphans` re-embeds after model changes and removes duplicate
   tasks (2 duplicates removed in the first real run).
+- **Bulk reference ingestion.** `ingest_refs.py --dir <path>` normalizes any
+  directory of markdown/text reference material (articles, pattern notes,
+  component-library docs) into documents + embeddings, stamping the source
+  label and origin path on every row. Titles come from frontmatter or a
+  humanized file name; the embedding input carries the title and any
+  frontmatter `context`, while the stored chunk stays the raw body. Dry-run
+  by default, idempotent per (source, title), and a file that fails to embed
+  writes nothing, so a partial run is retryable.
 - **Seed corpus (14 cases).** `seed_corpus.py` ships hand-authored
   resolved cases including deliberate confusable pairs (two navbars, two
   buttons, two forms, two galleries, two tables); `verify_corpus.py`

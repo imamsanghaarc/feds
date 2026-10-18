@@ -109,6 +109,44 @@ PROVIDER_COOLDOWN_SECONDS = float(os.getenv("PROVIDER_COOLDOWN_SECONDS", "900"))
 NEON_DATABASE_URL = os.getenv("NEON_DATABASE_URL", "")
 
 
+# --- Operator authorization --------------------------------------------------
+#
+# Decision attribution answers "who decided"; this policy answers "who MAY
+# decide". Read at call time so the environment is the single switch, testable
+# without reimporting anything.
+#
+#   FEDS_ALLOWED_OPERATORS="alice,bob"
+#
+# Unset keeps single-operator local mode: only `operator-local` may decide.
+# Once a list is set it is enforced exactly - `operator-local` itself must be
+# listed to keep working, so a shared deployment can never be decided by the
+# anonymous default.
+
+DEFAULT_OPERATOR = "operator-local"
+
+
+def allowed_operators() -> set[str] | None:
+    """The configured allowlist, case-folded; None means local-only mode."""
+    raw = os.getenv("FEDS_ALLOWED_OPERATORS", "")
+    names = {part.strip().casefold() for part in raw.split(",") if part.strip()}
+    return names or None
+
+
+def operator_authorized(operator: str) -> bool:
+    """Whether this operator may approve or reject a parked run.
+
+    Fail-closed: an empty name is never authorized, and a configured list
+    admits only its members.
+    """
+    name = (operator or "").strip().casefold()
+    if not name:
+        return False
+    allowlist = allowed_operators()
+    if allowlist is None:
+        return name == DEFAULT_OPERATOR.casefold()
+    return name in allowlist
+
+
 # --- Cost accounting ----------------------------------------------------------
 #
 # List price in USD per one MILLION tokens as (input, output). This keeps the

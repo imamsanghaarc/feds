@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
+import re
 import sys
 from pathlib import Path
 
@@ -283,29 +285,210 @@ def test_decide_command_validates_input() -> None:
         sys.argv = ["worker.py", "--decide", "abc123", "approve", "extra", "extra2"]
         asyncio.run(worker.main())
         check("too many --decide args are rejected", captured == {}, str(captured))
+
+        # A refusal (or any failure) must not look like success to a shell.
+        sys.argv = ["worker.py", "--decide", "abc123", "approve"]
+        check(
+            "a failed decision reports a non-zero exit code",
+            asyncio.run(worker.main()) == 1,
+        )
+        sys.argv = ["worker.py", "--decide", "abc123", "maybe"]
+        check(
+            "a usage error reports exit code 2",
+            asyncio.run(worker.main()) == 2,
+        )
     finally:
         worker.decide_run = original
         sys.argv = original_argv
 
 
+def test_operator_authorization_policy() -> None:
+    """Who MAY decide is policy, not a name typed into a CLI argument.
+
+    Unset allowlist keeps single-operator local mode (only `operator-local`);
+    a configured list is enforced case-insensitively and excludes the
+    anonymous default unless it is listed explicitly. Read at call time, so
+    the same switch works for the CLI, tests, and a future console.
+    """
+    saved = os.environ.pop("FEDS_ALLOWED_OPERATORS", None)
+    try:
+        check(
+            "local mode allows the default operator",
+            worker.operator_authorized("operator-local"),
+        )
+        check(
+            "local mode refuses any other name",
+            not worker.operator_authorized("dana"),
+        )
+        check(
+            "blank operators are refused",
+            not worker.operator_authorized("   "),
+        )
+        check(
+            "local mode compares names case-insensitively",
+            worker.operator_authorized("Operator-Local"),
+        )
+
+        os.environ["FEDS_ALLOWED_OPERATORS"] = "alice, BOB ,,"
+        check(
+            "allowlist admits listed names, trimmed",
+            worker.operator_authorized("  Alice ") and worker.operator_authorized("bob"),
+        )
+        check(
+            "allowlist refuses unlisted names",
+            not worker.operator_authorized("dana"),
+        )
+        check(
+            "allowlist excludes the anonymous default unless listed",
+            not worker.operator_authorized("operator-local"),
+        )
+    finally:
+        if saved is None:
+            os.environ.pop("FEDS_ALLOWED_OPERATORS", None)
+        else:
+            os.environ["FEDS_ALLOWED_OPERATORS"] = saved
+
+
+def test_decide_run_enforces_operator_authorization() -> None:
+    """An unauthorized decision is refused before the run is touched."""
+    source = inspect.getsource(worker.decide_run)
+    check("decide_run consults the operator policy", "operator_authorized(" in source)
+    check("refused attempts are audited", '"approval_refused"' in source)
+    check(
+        "decide_run reports success as a boolean",
+        "-> bool" in source.splitlines()[0],
+        source.splitlines()[0],
+    )
+    policy_at = source.index("operator_authorized(")
+    for later in ("_conversation_lock(", "state.approve(", "UPDATE run_states SET status"):
+        check(
+            f"policy runs before {later}",
+            policy_at < source.index(later),
+        )
+
+
+def test_reference_ingestion_normalizes_files() -> None:
+    """Bulk ingestion: frontmatter wins, the stored body excludes it, and the
+    walker takes reference text only."""
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    import ingest_refs
+
+    doc = ingest_refs.parse_reference(
+        "---\ntitle: Button hit areas\ncontext: WCAG 2.2 target size\n---\n\nReal body.\n",
+        Path("docs/button-targets.md"),
+        "reference-doc",
+    )
+    check("frontmatter supplies the title", bool(doc) and doc["title"] == "Button hit areas", str(doc))
+    check("the stored body excludes the frontmatter", bool(doc) and doc["body"] == "Real body.", str(doc))
+    check(
+        "context is kept for the embedding input",
+        bool(doc) and doc["context"] == "WCAG 2.2 target size",
+        str(doc),
+    )
+    check(
+        "attribution is stamped",
+        bool(doc)
+        and doc["metadata"]["source"] == "reference-doc"
+        and doc["metadata"]["ingested_from"] == "docs/button-targets.md",
+        str(doc and doc["metadata"]),
+    )
+
+    fallback = ingest_refs.parse_reference(
+        "No frontmatter here.", Path("notes/grid-basics.md"), "reference-doc"
+    )
+    check(
+        "a file name becomes a readable title",
+        bool(fallback) and fallback["title"] == "Grid basics",
+        str(fallback),
+    )
+    check(
+        "the title origin is recorded",
+        bool(fallback) and fallback["metadata"]["title_from"] == "filename",
+        str(fallback),
+    )
+
+    check(
+        "a frontmatter-only file is refused",
+        ingest_refs.parse_reference("---\ntitle: x\n---\n", Path("a.md"), "s") is None,
+    )
+    check(
+        "a whitespace-only file is refused",
+        ingest_refs.parse_reference("   \n\n", Path("a.md"), "s") is None,
+    )
+
+    root = Path(tempfile.mkdtemp())
+    try:
+        (root / "a.md").write_text("a", encoding="utf-8")
+        (root / "sub").mkdir()
+        (root / "sub" / "b.txt").write_text("b", encoding="utf-8")
+        (root / "image.png").write_bytes(b"\x89PNG\r\n")
+        found = [p.name for p in ingest_refs.iter_reference_files(root)]
+        check(
+            "the walker takes .md/.txt and ignores the rest",
+            found == ["a.md", "b.txt"],
+            str(found),
+        )
+    finally:
+        shutil.rmtree(root)
+
+
 def test_audit_vocabulary_is_closed() -> None:
-    """Every action the worker emits must exist in the course's closed vocabulary."""
-    known = {
-        "message_received",
-        "skill_activated",
-        "capability_invoked",
-        "message_sent",
-        "guardrail_tripped",
-        "error",
-    }
+    """Actions and events on the trail are a closed set.
+
+    The schema's CHECK constraint is the source of truth for action names: the
+    worker may never emit one the database would reject. Actions are read from
+    the real write sites (bound `"action"` params, `_write_audit_row` call
+    sites, and the helpers that insert their own actor/action literals). Events
+    are not constrained by the schema, so the accepted set is pinned here.
+    """
+    schema = Path("setup_neon.py").read_text(encoding="utf-8")
+    block = re.search(
+        r"action\s+TEXT NOT NULL CHECK \(action IN \((.*?)\)\)", schema, re.S
+    )
+    check("the schema constrains audit actions", block is not None)
+    allowed = set(re.findall(r"'([a-z_]+)'", block.group(1))) if block else set()
+    check(
+        "the constraint knows the core actions",
+        {"message_received", "capability_invoked"} <= allowed,
+        str(sorted(allowed)),
+    )
+
     source = inspect.getsource(worker)
-    emitted = set()
-    for marker in ("message_received", "guardrail_tripped", "skill_activated",
-                   "capability_invoked", "message_sent", '"error"'):
-        if marker.strip('"') in source:
-            emitted.add(marker.strip('"'))
-    unknown = emitted - known
-    check("worker emits only known audit actions", not unknown, f"unknown={unknown}")
+    actions = set(re.findall(r'"action":\s*"([a-z_]+)"', source))
+    actions |= set(
+        re.findall(r'_write_audit_row,\s*\n\s*[^"\n]+\n\s*"([a-z_]+)"', source)
+    )
+    actions |= set(re.findall(r'"worker:[a-z-]+",\s*\n\s*"([a-z_]+)",', source))
+    check(
+        "the scan found the real write sites",
+        len(actions) >= 3,
+        str(sorted(actions)),
+    )
+    rejected = actions - allowed
+    check(
+        "worker emits only actions the schema accepts",
+        not rejected,
+        f"rejected={rejected}",
+    )
+
+    known_events = {
+        "started",
+        "completed",
+        "approval_pending",
+        "approval_decided",
+        "approval_refused",
+    }
+    events = set(re.findall(r'"event":\s*"([a-z_]+)"', source))
+    check(
+        "worker emits only known decision events",
+        not (events - known_events),
+        f"unknown={events - known_events}",
+    )
+    check("approval decisions are on the trail", "approval_decided" in events, str(events))
+    check("approval refusals are on the trail", "approval_refused" in events, str(events))
 
 
 def test_mcp_emits_only_known_audit_actions() -> None:
@@ -749,6 +932,14 @@ def test_decisions_record_who_decided() -> None:
     main_source = inspect.getsource(worker.main)
     schema = Path("setup_neon.py").read_text(encoding="utf-8")
     check("run_states gains an operator column", "operator TEXT" in schema)
+    check(
+        "the schema creates run_states (not only alters it)",
+        "CREATE TABLE IF NOT EXISTS run_states (" in schema,
+    )
+    check(
+        "run_states statuses are constrained",
+        "'awaiting', 'approved', 'rejected', 'resumed', 'error'" in schema,
+    )
     check("the decision UPDATE stores the operator", "operator=:operator" in decide)
     check("the decision is audited with the operator", "approval_decided" in decide and "operator" in decide)
     check("the CLI documents the optional operator", "[operator]" in main_source)
@@ -860,6 +1051,9 @@ def main() -> int:
     test_record_turn_usage_is_best_effort_and_priced()
     test_conversation_lock_guards_decisions()
     test_decisions_record_who_decided()
+    test_operator_authorization_policy()
+    test_decide_run_enforces_operator_authorization()
+    test_reference_ingestion_normalizes_files()
     test_skills_compose_via_filesystem_handoff()
     test_replay_reports_cost_rollups()
     test_memory_tools_are_registered()

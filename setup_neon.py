@@ -117,6 +117,24 @@ CREATE TABLE IF NOT EXISTS memories (
 CREATE INDEX IF NOT EXISTS idx_memories_scope_owner
     ON memories(scope, owner, created_at);
 
+-- Decision 9: a gated tool pauses its run and parks the serialized agent state
+-- here until an operator decides with --decide. This table is created (not
+-- merely altered below) so a fresh deployment can park and resume approvals at
+-- all; before this it existed only in environments where it had been made by
+-- hand.
+CREATE TABLE IF NOT EXISTS run_states (
+    run_id          TEXT PRIMARY KEY,
+    conversation_id TEXT REFERENCES conversations(session_id) ON DELETE CASCADE,
+    tool_name       TEXT NOT NULL,
+    state_text      TEXT NOT NULL,
+    status          TEXT NOT NULL
+                    CHECK (status IN ('awaiting', 'approved', 'rejected', 'resumed', 'error')),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_run_states_conversation
+    ON run_states(conversation_id, created_at DESC);
+
 -- Added when operator attribution landed: who approved or rejected each run.
 -- `IF NOT EXISTS` keeps the statement safe on a database that already has it.
 ALTER TABLE run_states ADD COLUMN IF NOT EXISTS operator TEXT;

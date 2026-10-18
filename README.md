@@ -157,6 +157,9 @@ uv run python replay.py <conversation_id> --json
 
 uv run python reembed.py --dry-run            # what would change
 uv run python reembed.py --apply --dedupe --purge-orphans
+
+uv run python ingest_refs.py --dir docs/reference            # dry-run
+uv run python ingest_refs.py --dir docs/reference --apply    # idempotent per (source, title)
 ```
 
 Approvals:
@@ -165,6 +168,13 @@ Approvals:
 uv run python worker.py --decide <run_id> approve
 uv run python worker.py --decide <run_id> reject
 ```
+
+Who may decide is policy, not a name typed into the argument. With no
+`FEDS_ALLOWED_OPERATORS` set, only `operator-local` can decide; set a
+comma-separated allowlist (`FEDS_ALLOWED_OPERATORS=alice,bob`) to grant real
+names — the anonymous default is then refused unless it is listed too. An
+unauthorized decision writes an `approval_refused` audit row and the CLI
+exits non-zero.
 
 ---
 

@@ -1,10 +1,10 @@
 # Sanghaar's Work — Remaining Items
 
 Everything shipped has been removed from this file; it now lists only what is
-not done. The evidence for completed work lives in `eval_results.md`, in the
-test suite (`uv run python run_tests.py`), and in git history.
+not done. The evidence for completed work lives in `done.md`, `eval_results.md`,
+the test suite (`uv run python run_tests.py`), and git history.
 
-Legend: **OPEN** = not built yet. **BLOCKED** = the work is written but a
+Legend: **OPEN** = not built yet. **BLOCKED** = the work is written but an
 external condition stops verification. **DEFERRED** = paused by agreement.
 
 ---
@@ -41,33 +41,14 @@ cannot be exercised live — the failover logic is proven by tests and forced
 Gemini and OpenAI are the only embedding-capable providers configured, and
 OpenAI is disabled — so embeddings have exactly one live path. A local model
 (Ollama, or a sentence-transformers variant at 768 dims so vectors stay
-compatible) would make the semantic library quota-proof. After adding any
-second model, run `reembed.py --dry-run` first: vectors from different
-models must never be mixed (search is model-scoped by design).
+compatible) would make the semantic library quota-proof. Note that ingestion
+(`ingest_refs.py`) and seeding both depend on that single live path. After
+adding any second model, run `reembed.py --dry-run` first: vectors from
+different models must never be mixed (search is model-scoped by design).
 
 ---
 
-## 4. Bulk reference ingestion — OPEN
-
-No reader for articles, pattern documents, or prior component libraries
-beyond individual saved tasks. `seed_corpus.py` covers resolved-case data
-only. Needs an ingester that normalizes external reference material into
-`documents` + `embeddings` with source attribution.
-
----
-
-## 5. Operator authorization — OPEN
-
-`decide_run(run_id, decision, operator)` now records *who* decided
-(`run_states.operator` + an `approval_decided` audit row), but nothing
-enforces *who is allowed* to decide. Until a role model exists, every
-recorded operator is claimed, not verified. Build: identity for operators,
-a policy checked inside `decide_run`, and a test that an unauthorized
-operator is refused (including via the CLI's `--decide` path).
-
----
-
-## 6. Secrets rotation before sharing the repo — OPEN
+## 4. Secrets rotation before sharing the repo — OPEN
 
 Credentials already live in the gitignored `.env` and a planted-secret
 scanner in `test_config.py` keeps them out of source. What remains is the
@@ -76,7 +57,7 @@ repo or host is shared with anyone.
 
 ---
 
-## 7. Stable-rate eval evidence — OPEN
+## 5. Stable-rate eval evidence — OPEN
 
 The trigger eval is 11/11 as a **single sample per case** (recorded with the
 load-vs-reply evidence split in `eval_results.md` section B). A stronger
@@ -86,7 +67,7 @@ claim needs three runs per case for a stable rate, and — if "selected" and
 
 ---
 
-## 8. Deployment and operations — DEFERRED by agreement
+## 6. Deployment and operations — DEFERRED by agreement
 
 - **Tested container deployment.** `Dockerfile`, `compose.yml`, and
   `.dockerignore` are provided and reviewed (including the
@@ -99,17 +80,30 @@ claim needs three runs per case for a stable rate, and — if "selected" and
 
 ---
 
+## Completed since this list was last rewritten
+
+- **Operator authorization** — decisions are policy-checked against
+  `FEDS_ALLOWED_OPERATORS` inside `decide_run` before the run is touched;
+  refusals are audited as `approval_refused` and the CLI exits non-zero.
+  Proven live by `smoke_operator_auth.py` (zero model quota).
+- **Bulk reference ingestion** — `ingest_refs.py` normalizes a directory of
+  reference text into documents + embeddings with source attribution, idempotent
+  per (source, title). Proven live by `smoke_ingest.py`.
+- **Schema gap fixed** — `run_states` is now created by `setup_neon.py`
+  (it previously existed only where it had been made by hand, so a fresh
+  deployment could not park an approval at all).
+
+---
+
 ## Priority order
 
 1. **System prompt eval** (item 1, needs quota) — converts the last PARTIAL
    into a measurement.
 2. **Second chat provider** (item 2) — restores real failover.
-3. **Local embedding model** (item 3) — makes embeddings quota-proof.
-4. **Operator authorization** (item 5) — closes the trust gap the attribution
-   work opened.
-5. **Secrets rotation** (item 6) — required before any sharing.
-6. **Bulk ingestion** (item 4), **stable-rate evals** (item 7), then the
-   deferred deployment work (item 8).
+3. **Local embedding model** (item 3) — makes embeddings (and ingestion)
+   quota-proof.
+4. **Secrets rotation** (item 4) — required before any sharing.
+5. **Stable-rate evals** (item 5), then the deferred deployment work (item 6).
 
 Co-founder features live in `muheeb.md` (approval console, identity,
 budgets, CI, notifications); this file is Sanghaar's queue only.

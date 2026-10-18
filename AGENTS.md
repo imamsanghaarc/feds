@@ -47,8 +47,13 @@ thing allowed to touch Neon (pgvector).
 - One agent turn: `uv run python worker.py "prompt"`. Inspect afterwards:
   `uv run python replay.py <conversation_id>`.
 - Resume a parked approval: `uv run python worker.py --decide <run_id>
-  approve|reject [operator]`.
+  approve|reject [operator]`. Decisions are policy-checked:
+  `FEDS_ALLOWED_OPERATORS` (unset = only `operator-local`); a refusal is
+  audited as `approval_refused` and exits non-zero (2 = usage error).
 - Provider availability: `uv run python status_providers.py`.
+- Ingest reference material: `uv run python ingest_refs.py --dir <path>
+  [--source label] [--apply]` — dry-run by default, idempotent per
+  (source, title), so re-running only adds new files.
 
 ## Evaluation rules (honesty is the point)
 
