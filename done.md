@@ -194,3 +194,6 @@ Scoped tools over Neon, the agent's entire database surface:
 - **Founder work queues.** `done.md` (this file), `missing.md` (remaining
   work, Sanghaar), `muheeb.md` (features, Muheeb), and `plan.md` (the ten
   design decisions) keep ownership and status explicit.
+- **Design input.** `FEDS-Self-Learning-Algorithm-Design.docx` (v1.0 draft,
+  kept in the repo) specifies the next phase — the Verified Lesson Loop — with
+  a seven-phase roadmap; `missing.md` maps it against what already exists.

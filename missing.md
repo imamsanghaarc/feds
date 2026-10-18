@@ -25,6 +25,11 @@ uv run python replay.py <conversation_id>   # confirm tool names are real
 Free-tier Gemini quota exhausted mid-run before; the run is resumable one
 case at a time. Do not round a partial pass rate into a score.
 
+**Resuming (planned for tomorrow, with the new API key):** put the new key in
+`.env` (`GEMINI_API_KEY=...`, or add the new provider and mark it enabled),
+then run one case at a time with the commands above. No code changes are
+needed — the worker and the harness both read the key through `config.py`.
+
 ---
 
 ## 2. Second enabled chat provider — OPEN
@@ -63,7 +68,8 @@ The trigger eval is 11/11 as a **single sample per case** (recorded with the
 load-vs-reply evidence split in `eval_results.md` section B). A stronger
 claim needs three runs per case for a stable rate, and — if "selected" and
 "loaded" are ever to be the same claim — a harness condition that forces the
-`load_skill` call before scoring. Quota-gated like item 1.
+`load_skill` call before scoring. Quota-gated like item 1, so it also resumes
+with the new API key tomorrow.
 
 ---
 
@@ -77,6 +83,34 @@ claim needs three runs per case for a stable rate, and — if "selected" and
 - Restart supervision, rate limiting, and backpressure under load.
 - Cost-shape estimate (course Part 5) — the rollup data
   (`replay.py --costs`) now exists to build it from.
+
+---
+
+## Design input received: the Verified Lesson Loop
+
+`FEDS-Self-Learning-Algorithm-Design.docx` (v1.0 draft) specifies the next
+phase: a per-task loop of verify → repair → reflect → gate → save, with a
+reward score, tiered memory, confidence dynamics, a consolidator, a knowledge
+cache, holdout lift measurement and a shared global layer. Its roadmap
+(section 15) has seven phases:
+
+1. Verifier and reward score (build, tests, lint, console, screenshot)
+2. Lesson store, gate, mistake ledger and retrieval
+3. Confidence updates, quarantine and holdout lift measurement
+4. Consolidator, regression evals and versioned rollback
+5. Knowledge cache and framework learning
+6. Shared global layer and privacy controls
+7. Local model routing
+
+What already exists here and maps onto it: the memory store with private and
+global scopes, three save gates (evidence required, project-specific refused,
+sanitized), promotion provenance plus human approval, model-scoped semantic
+retrieval over the task library, and the reference ingester for knowledge-cache
+style material. What the design adds and is **not built yet**: confidence
+dynamics (`confidence`, `status` = active/quarantined/rule), the normalized
+mistake ledger, duplicate-merge and contradiction checks, the weighted reward
+score, holdout lift measurement, consolidation and rollback, and local model
+routing. Phases 1–3 are the natural first workstream.
 
 ---
 

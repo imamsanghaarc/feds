@@ -107,3 +107,5 @@ thing allowed to touch Neon (pgvector).
 - `muheeb.md` — Muheeb's queue: features not built yet.
 - `eval_results.md` — measured results only. `plan.md` — the ten design
   decisions behind the architecture.
+- `FEDS-Self-Learning-Algorithm-Design.docx` — the Verified Lesson Loop design
+  for the next phase; `missing.md` maps its seven phases to what exists.
