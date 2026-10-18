@@ -96,6 +96,10 @@ CREATE TABLE IF NOT EXISTS capability_invocations (
 );
 CREATE INDEX IF NOT EXISTS idx_cap_conv
     ON capability_invocations(conversation_id, created_at);
+
+-- Added when operator attribution landed: who approved or rejected each run.
+-- `IF NOT EXISTS` keeps the statement safe on a database that already has it.
+ALTER TABLE run_states ADD COLUMN IF NOT EXISTS operator TEXT;
 """
 
 

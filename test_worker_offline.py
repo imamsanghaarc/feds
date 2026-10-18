@@ -11,6 +11,7 @@ import asyncio
 import inspect
 import json
 import sys
+from pathlib import Path
 
 import worker
 from frontend_workspace_mcp import server as mcp_server
@@ -247,9 +248,10 @@ def test_worker_publish_asset_requires_approval() -> None:
 def test_decide_command_validates_input() -> None:
     captured: dict[str, object] = {}
 
-    async def fake_decide(run_id: str, decision: str) -> None:
+    async def fake_decide(run_id: str, decision: str, operator: str = "") -> None:
         captured["run_id"] = run_id
         captured["decision"] = decision
+        captured["operator"] = operator
 
     original = worker.decide_run
     worker.decide_run = fake_decide
@@ -257,13 +259,30 @@ def test_decide_command_validates_input() -> None:
     try:
         sys.argv = ["worker.py", "--decide", "abc123", "approve"]
         asyncio.run(worker.main())
-        check("valid --decide is dispatched", captured == {"run_id": "abc123", "decision": "approve"},
-              str(captured))
+        check(
+            "valid --decide is dispatched",
+            captured == {"run_id": "abc123", "decision": "approve", "operator": "operator-local"},
+            str(captured),
+        )
+
+        captured.clear()
+        sys.argv = ["worker.py", "--decide", "abc123", "approve", "dana"]
+        asyncio.run(worker.main())
+        check(
+            "operator is forwarded to decisions",
+            captured == {"run_id": "abc123", "decision": "approve", "operator": "dana"},
+            str(captured),
+        )
 
         captured.clear()
         sys.argv = ["worker.py", "--decide", "abc123", "maybe"]
         asyncio.run(worker.main())
         check("invalid decision is rejected", captured == {}, str(captured))
+
+        captured.clear()
+        sys.argv = ["worker.py", "--decide", "abc123", "approve", "extra", "extra2"]
+        asyncio.run(worker.main())
+        check("too many --decide args are rejected", captured == {}, str(captured))
     finally:
         worker.decide_run = original
         sys.argv = original_argv
@@ -416,6 +435,28 @@ def test_resume_path_is_fully_wired() -> None:
     check("rejection is audited", "_write_publish_denied" in source)
 
 
+def test_skills_live_in_the_portable_location() -> None:
+    """Concept 4: one folder every compliant client can read.
+
+    `.claude/skills` is read by Claude Code, used as OpenCode's fallback, and is
+    what the Worker's own SDK points at, so skills are packaged once.
+    """
+    portable = worker.ROOT / ".claude" / "skills"
+    check(".claude/skills exists", portable.is_dir())
+    check(
+        "SKILLS_ROOT resolves to the portable location",
+        worker.SKILLS_ROOT == portable,
+        str(worker.SKILLS_ROOT),
+    )
+    check("no stray top-level skills/ directory", not (worker.ROOT / "skills").is_dir())
+    for skill in ("frontend-development", "summarize-component"):
+        check(f"{skill} is packaged portably", (portable / skill / "SKILL.md").is_file())
+    check(
+        "references travel with their skill",
+        any((portable / "summarize-component" / "references").glob("*.md")),
+    )
+
+
 def test_official_name_is_feds() -> None:
     import config
 
@@ -566,6 +607,173 @@ def test_disabled_providers_are_routable_when_enabled() -> None:
         config.ENABLED_FLAGS.update(original)
 
 
+def test_pricing_is_honest() -> None:
+    """Known models cost a non-negative estimate; unknown models never fake zero."""
+    import config
+
+    model_name = config.CHAT_MODELS[config.chat_order()[0]]["model"]
+    priced = config.cost_cents_for(model_name, 1000, 500)
+    check("known model yields a priced estimate", isinstance(priced, int) and priced >= 0, str(priced))
+    check("unknown model yields NULL cost, not zero", config.cost_cents_for("no-such-model", 1000, 500) is None)
+    check("zero tokens cost nothing for a known model",
+          config.cost_cents_for(model_name, 0, 0) == 0)
+    check("1M output tokens at the flash list price is 250 cents",
+          config.cost_cents_for("gemini-3.5-flash", 0, 1_000_000) == 250)
+
+
+def test_turn_usage_extraction() -> None:
+    class _Usage:
+        requests = 2
+        input_tokens = 123
+        output_tokens = 45
+        total_tokens = 168
+
+    class _Wrapper:
+        usage = _Usage()
+
+    class _Result:
+        context_wrapper = _Wrapper()
+
+    counts = worker._turn_usage_from(_Result())
+    check("aggregate usage is pulled from the context wrapper",
+          counts == {"requests": 2, "input_tokens": 123, "output_tokens": 45, "total_tokens": 168},
+          str(counts))
+
+    class _Empty:
+        pass
+
+    check("a result with no usage yields None", worker._turn_usage_from(_Empty()) is None)
+
+
+class _RecordingConn:
+    async def execute(self, statement, params=None):
+        SINK["statement"] = str(statement)
+        SINK["params"] = dict(params or {})
+
+
+class _RecordingResult:
+    async def __aenter__(self):
+        return _RecordingConn()
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _RecordingEngine:
+    def begin(self):
+        return _RecordingResult()
+
+
+class _UsageResult:
+    class context_wrapper:
+        class usage:
+            requests = 2
+            input_tokens = 123
+            output_tokens = 45
+            total_tokens = 168
+
+
+SINK: dict[str, object] = {}
+
+
+class _UnnamedChatModel:
+    model = "gemini-3.5-flash"
+    _last_provider = "gemini"
+
+
+class _UnknownModelChatModel:
+    model = "not-an-installed-model-xyz"
+    _last_provider = "gemini"
+
+
+def _record_usage_with(chat_model) -> None:
+    asyncio.run(
+        worker._record_turn_usage(
+            _RecordingEngine(), "conv123", chat_model, _UsageResult(), 0.0
+        )
+    )
+
+
+def test_record_turn_usage_is_best_effort_and_priced() -> None:
+    SINK.clear()
+    _record_usage_with(_UnnamedChatModel())
+    check("one chat.turn capability row is written",
+          "capability_invocations" in SINK.get("statement", ""), str(SINK.get("statement", "")))
+    params = SINK.get("params", {})
+    check("capability is named chat.turn", params.get("capability") == "chat.turn", str(params))
+    check("tokens land in the result json",
+          json.loads(params.get("result", "{}")).get("total_tokens") == 168, str(params.get("result")))
+    check("priced model carries a cost estimate",
+          isinstance(params.get("cost_cents"), int) and params["cost_cents"] >= 0,
+          str(params.get("cost_cents")))
+    check("cost basis is labelled as an estimate",
+          json.loads(params.get("arguments", "{}")).get("cost_basis") == "list_price_estimate",
+          str(params.get("arguments")))
+
+    SINK.clear()
+    _record_usage_with(_UnknownModelChatModel())
+    check("unknown model stores NULL cost, not zero",
+          SINK.get("params", {}).get("cost_cents") is None, str(SINK.get("params")))
+
+    SINK.clear()
+    asyncio.run(worker._record_turn_usage(_RecordingEngine(), "conv", _UnnamedChatModel(), object(), 0.0))
+    check("a result without usage writes nothing", SINK == {}, str(SINK))
+
+
+def test_conversation_lock_guards_decisions() -> None:
+    """Decision 10: one advisory lock must wrap the whole resume path."""
+    source = inspect.getsource(worker)
+    check(
+        "advisory lock helper exists",
+        hasattr(worker, "_conversation_lock"),
+        "worker._conversation_lock missing",
+    )
+    check("lock uses the try-lock form (refuse, never wait)",
+          "pg_try_advisory_lock" in inspect.getsource(worker._conversation_lock))
+    check("lock is always released", "pg_advisory_unlock" in inspect.getsource(worker._conversation_lock))
+    decide = inspect.getsource(worker.decide_run)
+    check("decide_run holds the lock", "_conversation_lock" in decide)
+    check("decide_run refuses a contended conversation", "retry after it finishes" in decide)
+
+
+def test_decisions_record_who_decided() -> None:
+    decide = inspect.getsource(worker.decide_run)
+    main_source = inspect.getsource(worker.main)
+    schema = Path("setup_neon.py").read_text(encoding="utf-8")
+    check("run_states gains an operator column", "operator TEXT" in schema)
+    check("the decision UPDATE stores the operator", "operator=:operator" in decide)
+    check("the decision is audited with the operator", "approval_decided" in decide and "operator" in decide)
+    check("the CLI documents the optional operator", "[operator]" in main_source)
+
+
+def test_skills_compose_via_filesystem_handoff() -> None:
+    """Concept 5: one skill's output is the next skill's input, without re-collection."""
+    summary = (Path(".claude/skills/summarize-component/SKILL.md")).read_text(encoding="utf-8")
+    escalate = (Path(".claude/skills/escalate-review/SKILL.md")).read_text(encoding="utf-8")
+    check(
+        "summarize-component publishes a handoff artifact",
+        ".agents/handoff/" in summary and "save_task" in summary,
+        "no artifact handoff",
+    )
+    check(
+        "escalate-review consumes the handoff instead of re-summarizing",
+        ".agents/handoff/" in escalate and "re-summarize from scratch" in escalate,
+        "no consumption step",
+    )
+    check(
+        "escalate-review falls back to lookup_task when no file exists",
+        "lookup_task" in escalate and "type" in escalate,
+        "no handoff fallback",
+    )
+
+
+def test_replay_reports_cost_rollups() -> None:
+    source = Path("replay.py").read_text(encoding="utf-8")
+    check("a token/cost rollup query exists", "COST_ROLLUP_QUERY" in source)
+    check("rollup only counts rows that carry token usage", "result ? 'total_tokens'" in source)
+    check("the CLI exposes --costs", "--costs" in source)
+
+
 def main() -> int:
     test_guardrail_blocks_unsafe_input()
     test_guardrail_allows_real_work()
@@ -587,6 +795,7 @@ def main() -> int:
     test_invocation_context_manager_never_swallows_errors()
     test_mcp_tools_do_not_swallow_permission_errors()
     test_official_name_is_feds()
+    test_skills_live_in_the_portable_location()
     test_single_publish_path_and_approval_gate()
     test_resume_path_is_fully_wired()
     test_system_prompt_declares_feds()
@@ -597,6 +806,13 @@ def main() -> int:
     test_chat_only_providers_are_absent_from_embeddings()
     test_every_chat_provider_has_complete_settings()
     test_disabled_providers_are_routable_when_enabled()
+    test_pricing_is_honest()
+    test_turn_usage_extraction()
+    test_record_turn_usage_is_best_effort_and_priced()
+    test_conversation_lock_guards_decisions()
+    test_decisions_record_who_decided()
+    test_skills_compose_via_filesystem_handoff()
+    test_replay_reports_cost_rollups()
 
     print(f"\n{'ALL OFFLINE CHECKS PASSED' if not FAILURES else f'{len(FAILURES)} FAILED: {FAILURES}'}")
     return 1 if FAILURES else 0

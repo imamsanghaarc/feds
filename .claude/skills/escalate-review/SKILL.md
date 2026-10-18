@@ -1,6 +1,6 @@
 ---
 name: escalate-review
-description: Prepare a frontend engineering escalation package for a human reviewer. Use only when there has been one real build or review attempt and at least one true escalation condition exists: unresolved high-impact issue, negative user sentiment, accessibility risk, or explicit human-review request. Do NOT use for routine drafting, simple summaries, generic documentation lookup, or component creation.
+description: Prepare a frontend engineering escalation package for a human reviewer or another engineer to act on. Use when ANY of these is true: a QA or review process blocked the work; the user is visibly frustrated or sends negative sentiment; there is an accessibility, WCAG, or legal-adjacent risk; the user asks to hand it off, hand it over, get a second opinion, or send it for human review; or a high-impact issue is still unresolved. Triggers on "hand this off", "hand this over", "another engineer", "get a second opinion", "send for review", "QC blocked this", "escalate this". Do NOT use for routine drafting, for a written note or summary about a task (that is summarize-component), for generic documentation lookup, or for creating a component.
 ---
 
 # Escalate Review
@@ -25,7 +25,12 @@ If either condition fails, do not escalate. Write the ordinary answer instead.
 1. Load `references/escalation-package.md` and follow its section order.
 2. Gather evidence from the workspace with `lookup_task` or `find_similar_tasks`
    rather than describing work you have not checked.
-3. State plainly what remains unresolved and who needs to decide.
+3. **Consume the previous skill's work instead of redoing it.** If a handoff
+   note exists at `.agents/handoff/<component-slug>.md`, attach it as the
+   package's Summary section verbatim — do not re-summarize from scratch. If no
+   file exists, look for the note as a saved task (`lookup_task`, type
+   `"handoff"`); only when neither exists should you gather the facts yourself.
+4. State plainly what remains unresolved and who needs to decide.
 
 ## Rules
 

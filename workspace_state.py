@@ -22,6 +22,14 @@ QUERIES = [
     ("run_states by status", "select status, count(*) from run_states group by status"),
     ("approved tasks", "select count(*) from documents where metadata->>'status'='approved'"),
     ("published tasks", "select count(*) from documents where metadata ? 'published'"),
+    (
+        "token rollup (in/out, est. dollars)",
+        "select coalesce(sum((result->>'input_tokens')::bigint),0) || '/' || "
+        "coalesce(sum((result->>'output_tokens')::bigint),0) as tokens, "
+        "coalesce(sum(cost_cents),0)/100.0 as dollars "
+        "from capability_invocations where result ? 'total_tokens'",
+    ),
+    ("decisions recorded", "select operator, status, count(*) from run_states where operator is not null group by operator, status"),
 ]
 
 

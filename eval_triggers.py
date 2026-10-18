@@ -80,6 +80,25 @@ CASES: list[dict[str, object]] = [
         "expect": "escalate-review",
         "why": "explicit human-review request",
     },
+    # Collisions found by the first eval run, kept as regression cases.
+    {
+        "id": "should-fire-summarize-despite-escalate",
+        "prompt": "Give me a note on this navbar bug before I escalate it.",
+        "expect": "summarize-component",
+        "why": "asks for a note; 'escalate' must not hijack it",
+    },
+    {
+        "id": "should-fire-escalate-qa-blocked",
+        "prompt": "QA blocked this on accessibility grounds and the user is frustrated. Hand it off.",
+        "expect": "escalate-review",
+        "why": "review blocked it; no proof of a build attempt needed",
+    },
+    {
+        "id": "should-not-fire-reference-skill-ok",
+        "prompt": "Find the latest MDN documentation about container queries.",
+        "expect": None,
+        "why": "a reference skill may load; no workflow skill should",
+    },
 ]
 
 WORKFLOW_SKILLS = {
@@ -128,8 +147,14 @@ async def run_case(case: dict[str, object]) -> dict[str, object]:
 
     expected = case["expect"]
     if expected is None:
-        passed = chosen is None
-        observed: object = chosen or "none"
+        # A reference skill (css, html, typescript...) firing on a frontend
+        # question is exactly what progressive disclosure is for, so it is not a
+        # false positive. Only a *workflow* skill firing is a miss.
+        fired_workflow = chosen in WORKFLOW_SKILLS
+        passed = not fired_workflow
+        observed = chosen or "none"
+        if not passed:
+            observed = f"{chosen} (workflow skill)"
     else:
         passed = chosen == expected
         observed = chosen or "none"
@@ -137,49 +162,87 @@ async def run_case(case: dict[str, object]) -> dict[str, object]:
     return {**case, "chosen": observed, "passed": passed, "raw": output[:200]}
 
 
+RESULTS_PATH = "eval_trigger_results.json"
+
+
+def _load_previous() -> dict[str, dict]:
+    """Load prior results so a run can resume across quota cycles."""
+    from pathlib import Path
+
+    path = Path(RESULTS_PATH)
+    if not path.is_file():
+        return {}
+    try:
+        prior = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return {row["id"]: row for row in prior if isinstance(row, dict) and "id" in row}
+
+
+def _save(rows: list[dict]) -> None:
+    from pathlib import Path
+
+    Path(RESULTS_PATH).write_text(
+        json.dumps(rows, indent=2, default=str), encoding="utf-8"
+    )
+
+
 async def main() -> int:
     if os.getenv("RUN_LIVE_TESTS") != "1":
         print("[SKIP] trigger eval; set RUN_LIVE_TESTS=1 to run (consumes quota)")
         return 0
 
-    results: list[dict[str, object]] = []
+    only = set(sys.argv[1:]) or None
+    previous = _load_previous()
+
+    fresh: list[dict[str, object]] = []
     skipped = 0
     for case in CASES:
+        case_id = str(case["id"])
+        if only and case_id not in only:
+            continue
+
+        prior = previous.get(case_id)
+        if prior and "error" not in prior and not os.getenv("RETRY_ALL"):
+            print(f"[CACHED] {case_id:34s} {prior.get('chosen')}")
+            continue
+
         outcome = await run_case(case)
-        results.append(outcome)
+        fresh.append(outcome)
         if "error" in outcome:
             skipped += 1
-            print(f"[SKIP] {outcome['id']:34s} {str(outcome['error'])[:60]}")
-            # A dead provider will not recover mid-run; stop and report honestly
-            # rather than burning one call per remaining case.
+            print(f"[SKIP] {case_id:34s} {str(outcome['error'])[:56]}")
             if "Exhausted" in str(outcome["error"]):
                 print("      (provider exhausted; stopping this run)")
                 break
             continue
         mark = "PASS" if outcome["passed"] else "FAIL"
         print(
-            f"[{mark}] {outcome['id']:34s} expected={str(outcome['expect']):22s} "
+            f"[{mark}] {case_id:34s} expected={str(outcome['expect']):22s} "
             f"got={outcome['chosen']}"
         )
 
-    scored = [r for r in results if "error" not in r]
+    # Merge fresh results over any previous ones, keyed by case id.
+    merged = dict(previous)
+    merged.update({row["id"]: row for row in fresh})
+    ordered = [merged[str(c["id"])] for c in CASES if str(c["id"]) in merged]
+    _save(ordered)
+
+    scored = [r for r in ordered if "error" not in r]
     passed = sum(1 for r in scored if r["passed"])
+    outstanding = [c for c in CASES if str(c["id"]) not in merged]
+
     print()
-    suffix = f" ({skipped} not scored)" if skipped else ""
-    print(f"trigger accuracy: {passed}/{len(scored)} scored{suffix}")
-    for row in results:
-        if "error" not in row and not row["passed"]:
-            print(f"  MISS {row['id']}: {row['raw'][:120]!r}")
+    print(f"trigger accuracy: {passed}/{len(scored)} scored")
+    for row in scored:
+        if not row["passed"]:
+            print(f"  MISS {row['id']}: expected={row['expect']} got={row['chosen']}")
+    if outstanding:
+        print(f"not yet run   : {[str(c['id']) for c in outstanding]}")
+    print(f"wrote {RESULTS_PATH}")
 
-    Path = __import__("pathlib").Path
-    Path("eval_trigger_results.json").write_text(
-        json.dumps(results, indent=2, default=str), encoding="utf-8"
-    )
-    print("wrote eval_trigger_results.json")
-
-    if skipped:
-        print("\nINCOMPLETE: some cases could not be scored. Do not report this as a")
-        print("final accuracy figure; re-run when a provider has quota.")
+    if outstanding or skipped:
+        print("\nINCOMPLETE. Re-run later; completed cases are cached.")
         return 2
     return 0 if passed == len(scored) else 1
 

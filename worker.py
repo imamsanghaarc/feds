@@ -11,7 +11,9 @@ import asyncio
 import json
 import os
 import sys
+import time
 import uuid
+from contextlib import asynccontextmanager
 
 import psycopg
 from openai import AsyncOpenAI
@@ -73,7 +75,23 @@ def _force_utf8_console() -> None:
 _force_utf8_console()
 
 ROOT = Path(__file__).resolve().parent
-SKILLS_ROOT = ROOT / "skills"
+
+
+def _resolve_skills_root() -> Path:
+    """Locate the skills directory.
+
+    `.claude/skills` is the portable standard: Claude Code reads it, OpenCode
+    falls back to it, and the Worker's SDK points straight at it, so one copy
+    serves every client. A plain `skills/` directory is still honoured for
+    anyone who keeps them there.
+    """
+    for candidate in (ROOT / ".claude" / "skills", ROOT / "skills"):
+        if candidate.is_dir() and any(candidate.glob("*/SKILL.md")):
+            return candidate
+    return ROOT / ".claude" / "skills"
+
+
+SKILLS_ROOT = _resolve_skills_root()
 SYSTEM_PROMPT_PATH = ROOT / "SYSTEM_PROMPT.md"
 
 
@@ -192,6 +210,7 @@ from config import (  # noqa: E402
     OPENAI_CHAT_MODEL,
     PROVIDER_COOLDOWN_SECONDS,
     chat_order,
+    cost_cents_for,
 )
 
 # Legacy names kept so the rest of this module reads naturally.
@@ -534,6 +553,85 @@ class FallbackChatModel(OpenAIChatCompletionsModel):
         return _prefetched_stream(iterator, first)
 
 
+def _turn_usage_from(result) -> dict[str, int] | None:
+    """Pull the run's aggregate token counts from the SDK's context wrapper.
+
+    The Runner totals every model call there, so this sees the whole turn
+    including rotated providers - not just the primary.
+    """
+    wrapper = getattr(result, "context_wrapper", None)
+    usage = getattr(wrapper, "usage", None)
+    if usage is None:
+        return None
+    counts: dict[str, int] = {}
+    for key in ("requests", "input_tokens", "output_tokens", "total_tokens"):
+        value = getattr(usage, key, None)
+        if value is not None:
+            try:
+                counts[key] = int(value)
+            except (TypeError, ValueError):
+                continue
+    return counts or None
+
+
+async def _record_turn_usage(
+    engine,
+    conversation_id: str,
+    chat_model,
+    result,
+    turn_started: float,
+) -> None:
+    """Write one `chat.turn` row: the tokens this turn consumed and its cost.
+
+    cost_cents is NULL when the model has no known price - never a fake zero.
+    This runs even when the turn paused for approval, because those tokens are
+    already spent. Telemetry must never break the turn, so any failure here is
+    swallowed.
+    """
+    if not conversation_id:
+        return
+    usage = _turn_usage_from(result)
+    if not usage:
+        return
+    provider = getattr(chat_model, "_last_provider", None)
+    model_name = str(getattr(chat_model, "model", "") or "")
+    try:
+        cost = cost_cents_for(
+            model_name,
+            usage.get("input_tokens", 0),
+            usage.get("output_tokens", 0),
+        )
+    except Exception:
+        cost = None
+    try:
+        async with engine.begin() as db:
+            await db.execute(
+                text(
+                    "INSERT INTO capability_invocations "
+                    "(conversation_id, capability, arguments, result, status, latency_ms, cost_cents) "
+                    "VALUES (:conversation_id, :capability, CAST(:arguments AS jsonb), "
+                    "CAST(:result AS jsonb), :status, :latency_ms, :cost_cents)"
+                ),
+                {
+                    "conversation_id": conversation_id,
+                    "capability": "chat.turn",
+                    "arguments": json.dumps(
+                        {
+                            "provider": provider or "unknown",
+                            "model": model_name,
+                            "cost_basis": "list_price_estimate",
+                        }
+                    ),
+                    "result": json.dumps(usage),
+                    "status": "ok",
+                    "latency_ms": int((time.perf_counter() - turn_started) * 1000),
+                    "cost_cents": cost,
+                },
+            )
+    except Exception:
+        return
+
+
 def _write_publish_denied(asset_name: str, environment: str) -> None:
     """Record a publish that a human refused.
 
@@ -591,12 +689,13 @@ def _mcp_server(conversation_id: str | None) -> MCPServerStdio:
 def build_agent():
     sandbox_client = try_make_sandbox_client()
 
-    # On hosts with a compatible sandbox, use the crash course's preferred path:
-    # progressive skill loading from the local skills directory.
+    # On hosts with a compatible sandbox, use the SDK's lazy Skills capability.
+    # Skills resolve relative to the process working directory, so the project
+    # root is the only safe place to launch from.
     if sandbox_client is not None:
         skills_capability = Skills(
             lazy_from=LocalDirLazySkillSource(
-                source=LocalDir(src="skills"),
+                source=LocalDir(src=str(SKILLS_ROOT.relative_to(ROOT))),
             ),
             skills_path=".agents",
         )
@@ -644,6 +743,41 @@ def build_agent():
     ), None
 
 
+@asynccontextmanager
+async def _conversation_lock(engine, conversation_id: str):
+    """Hold a Postgres advisory lock for one conversation.
+
+    Decision 10: two operations on the same conversation at once will corrupt
+    its session. An advisory lock lives in the database, so it holds even when
+    the two callers are separate processes.
+
+    `pg_try_advisory_lock` is used rather than the blocking form so a second
+    caller is refused immediately instead of waiting on a lock it may never get.
+    """
+    if not conversation_id:
+        yield False
+        return
+
+    async with engine.connect() as conn:
+        acquired = (
+            await conn.execute(
+                text("SELECT pg_try_advisory_lock(hashtext(:cid))"),
+                {"cid": conversation_id},
+            )
+        ).scalar()
+        if not acquired:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            # Always release, even if the run raised, or the lock leaks.
+            await conn.execute(
+                text("SELECT pg_advisory_unlock(hashtext(:cid))"),
+                {"cid": conversation_id},
+            )
+
+
 async def run_task(user_input: str) -> None:
     global _CURRENT_CONVERSATION_ID
 
@@ -669,6 +803,7 @@ async def run_task(user_input: str) -> None:
             engine=engine,
             create_tables=True,
         )
+        turn_started = time.perf_counter()
 
         async with engine.begin() as db:
             await db.execute(
@@ -733,6 +868,13 @@ async def run_task(user_input: str) -> None:
                         tracing_disabled=True,
                     ),
                     )
+
+        # Token and cost rollup: one row for what the turn consumed, recorded
+        # even when the run pauses for approval, because those tokens are
+        # already spent.
+        await _record_turn_usage(
+            engine, conversation_id, agent.model, result, turn_started
+        )
 
         run_state = result.to_state()
         if run_state.get_interruptions():
@@ -807,7 +949,7 @@ async def run_task(user_input: str) -> None:
         await engine.dispose()
         _CURRENT_CONVERSATION_ID = None
 
-async def decide_run(run_id: str, decision: str) -> None:
+async def decide_run(run_id: str, decision: str, operator: str = "operator-local") -> None:
     decision = decision.lower()
     if decision not in {"approve", "approved", "reject", "rejected"}:
         print("Decision must be 'approve' or 'reject'.")
@@ -820,6 +962,10 @@ async def decide_run(run_id: str, decision: str) -> None:
         pool_pre_ping=True,
     )
     try:
+        # Idempotent schema nudge so an existing deployment gains the operator
+        # column without a manual migration step.
+        async with engine.begin() as db:
+            await db.execute(text("ALTER TABLE run_states ADD COLUMN IF NOT EXISTS operator TEXT"))
         async with engine.begin() as db:
             row = (
                 await db.execute(
@@ -835,75 +981,100 @@ async def decide_run(run_id: str, decision: str) -> None:
             return
 
         conversation_id = row["conversation_id"]
-        # RunState.from_string is async in this SDK version; calling it
-        # synchronously returns a coroutine and the resume dies later with a
-        # confusing 'coroutine has no attribute' error.
-        agent, _sandbox = build_agent()
-        state = await RunState.from_string(agent, row["state_text"])
-        interrupts = state.get_interruptions()
-        if not interrupts:
-            print("No pending approval remains for that run state.")
-            return
-
-        for item in interrupts:
-            if decision in {"approve", "approved"}:
-                state.approve(item)
-            else:
-                state.reject(item, rejection_message="Rejected by operator.")
-
-        approving = decision in {"approve", "approved"}
-        if not approving:
-            # A declined publish is itself an auditable event.
-            for item in interrupts:
-                await asyncio.to_thread(
-                    _write_publish_denied,
-                    str(getattr(item, "tool_name", "unknown")),
-                    "staging",
+        # Decision 10: two operators deciding the same parked run at once both
+        # hold a stale `state_text` with the same interruption; resuming both
+        # would interleave session writes and corrupt the conversation. The
+        # advisory lock spans processes, so the second caller is refused here.
+        async with _conversation_lock(engine, conversation_id) as locked:
+            if conversation_id and not locked:
+                print(
+                    "Another operation is running on that conversation; "
+                    "retry after it finishes."
                 )
+                return
+            # RunState.from_string is async in this SDK version; calling it
+            # synchronously returns a coroutine and the resume dies later with a
+            # confusing 'coroutine has no attribute' error.
+            agent, _sandbox = build_agent()
+            state = await RunState.from_string(agent, row["state_text"])
+            interrupts = state.get_interruptions()
+            if not interrupts:
+                print("No pending approval remains for that run state.")
+                return
 
-        session = None
-        if conversation_id:
-            session = SQLAlchemySession(session_id=conversation_id, engine=engine, create_tables=True)
+            for item in interrupts:
+                if decision in {"approve", "approved"}:
+                    state.approve(item)
+                else:
+                    state.reject(item, rejection_message="Rejected by operator.")
 
-        # The resumed run needs the same MCP wiring as the original, otherwise
-        # the gated tool it paused on is missing and the resume cannot proceed.
-        async with _mcp_server(conversation_id) as server:
-            agent.mcp_servers = [server]
-            result = await Runner.run(
-                agent,
-                state,
-                session=session,
-                run_config=RunConfig(workflow_name="feds", tracing_disabled=True),
-            )
-        further = result.to_state().get_interruptions()
-        if further:
-            new_run_id = uuid.uuid4().hex
+            approving = decision in {"approve", "approved"}
+            if not approving:
+                # A declined publish is itself an auditable event.
+                for item in interrupts:
+                    await asyncio.to_thread(
+                        _write_publish_denied,
+                        str(getattr(item, "tool_name", "unknown")),
+                        "staging",
+                    )
+
+            session = None
+            if conversation_id:
+                session = SQLAlchemySession(session_id=conversation_id, engine=engine, create_tables=True)
+
+            # The resumed run needs the same MCP wiring as the original, otherwise
+            # the gated tool it paused on is missing and the resume cannot proceed.
+            async with _mcp_server(conversation_id) as server:
+                agent.mcp_servers = [server]
+                result = await Runner.run(
+                    agent,
+                    state,
+                    session=session,
+                    run_config=RunConfig(workflow_name="feds", tracing_disabled=True),
+                )
+            further = result.to_state().get_interruptions()
+            if further:
+                new_run_id = uuid.uuid4().hex
+                async with engine.begin() as db:
+                    await db.execute(
+                        text(
+                            "INSERT INTO run_states (run_id, conversation_id, tool_name, state_text, status) "
+                            "VALUES (:run_id, :conversation_id, :tool_name, :state_text, 'awaiting')"
+                        ),
+                        {
+                            "run_id": new_run_id,
+                            "conversation_id": conversation_id,
+                            "tool_name": ", ".join(getattr(item, "tool_name", "unknown") for item in further),
+                            "state_text": result.to_state().to_string(),
+                        },
+                    )
+                print(f"Approval processed but another pause remains: run_id={new_run_id}")
+                return
+
+            final_output = str(result.final_output).strip() if result.final_output is not None else ""
+            decided_status = "resumed" if decision in {"approve", "approved"} else "rejected"
             async with engine.begin() as db:
                 await db.execute(
                     text(
-                        "INSERT INTO run_states (run_id, conversation_id, tool_name, state_text, status) "
-                        "VALUES (:run_id, :conversation_id, :tool_name, :state_text, 'awaiting')"
+                        "UPDATE run_states SET status=:status, operator=:operator, "
+                        "updated_at=NOW() WHERE run_id=:run_id"
                     ),
-                    {
-                        "run_id": new_run_id,
-                        "conversation_id": conversation_id,
-                        "tool_name": ", ".join(getattr(item, "tool_name", "unknown") for item in further),
-                        "state_text": result.to_state().to_string(),
-                    },
+                    {"run_id": run_id, "status": decided_status, "operator": operator},
                 )
-            print(f"Approval processed but another pause remains: run_id={new_run_id}")
-            return
-
-        final_output = str(result.final_output).strip() if result.final_output is not None else ""
-        async with engine.begin() as db:
-            await db.execute(
-                text("UPDATE run_states SET status=:status, updated_at=NOW() WHERE run_id=:run_id"),
-                {"run_id": run_id, "status": "resumed" if decision in {"approve", "approved"} else "rejected"},
-            )
-        if not final_output:
-            print(NO_OUTPUT)
-        else:
-            print(final_output)
+            # The decision itself belongs on the trail, with who made it.
+            if conversation_id:
+                await asyncio.to_thread(
+                    _write_audit_row,
+                    conversation_id,
+                    "capability_invoked",
+                    row["tool_name"] or "publish_task",
+                    {"run_id": run_id, "event": "approval_decided", "operator": operator},
+                    {"status": decided_status, "decision": decision},
+                )
+            if not final_output:
+                print(NO_OUTPUT)
+            else:
+                print(final_output)
     except Exception as exc:
         print(SKILL_FAILURE.format(error=exc))
     finally:
@@ -913,10 +1084,16 @@ async def decide_run(run_id: str, decision: str) -> None:
 async def main() -> None:
     args = sys.argv[1:]
     if args and args[0] == "--decide":
-        if len(args) != 3 or args[2] not in {"approve", "approved", "reject", "rejected"}:
-            print("Usage: uv run python worker.py --decide <run_id> approve")
+        # Usage: --decide <run_id> approve [operator]
+        # The recorded operator answers "who approved this" afterwards.
+        if (
+            len(args) not in {3, 4}
+            or args[2] not in {"approve", "approved", "reject", "rejected"}
+        ):
+            print("Usage: uv run python worker.py --decide <run_id> approve [operator]")
             return
-        await decide_run(args[1], args[2])
+        operator = args[3] if len(args) == 4 else "operator-local"
+        await decide_run(args[1], args[2], operator)
         return
 
     user_input = " ".join(args) if args else ""
@@ -932,7 +1109,7 @@ async def main() -> None:
             print(error)
         print(
             "Cross-check the folder structure: frontend-developer-FTE main folder "
-            "with skills at skills/frontend-development/SKILL.md."
+            "with skills at .claude/skills/frontend-development/SKILL.md."
         )
         return
 

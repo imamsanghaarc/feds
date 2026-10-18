@@ -15,8 +15,9 @@ Only quota/rate-limit failures trigger a rotation. A misconfigured credential or
 a genuine bug is surfaced instead of being silently routed around, so a broken
 key can never look like a healthy system.
 
-Secrets are embedded as requested for this live deployment. Move these to a
-managed secret store before sharing this source.
+Secrets are read from the environment by `require_config()`; the gitignored
+`.env` holds the live values for local runs. Nothing here hard-codes a
+credential, and `test_config.py`'s planted-secret scanner enforces that.
 """
 
 from __future__ import annotations
@@ -106,6 +107,52 @@ EMBEDDING_MODELS = {
 PROVIDER_COOLDOWN_SECONDS = float(os.getenv("PROVIDER_COOLDOWN_SECONDS", "900"))
 
 NEON_DATABASE_URL = os.getenv("NEON_DATABASE_URL", "")
+
+
+# --- Cost accounting ----------------------------------------------------------
+#
+# List price in USD per one MILLION tokens as (input, output). This keeps the
+# per-conversation token and cost rollup real instead of always null.
+#
+# These figures are the flash-tier list-price equivalents; the rollup reports
+# them as estimates (see cost_cents_for), not as billing data. A model absent
+# from this table gets cost_cents = NULL: no *known* price, never a fake zero.
+# Override any figure from the environment, e.g.
+# GEMINI_PRICING_USD_PER_M="0.25,2.00".
+
+
+def _env_pricing(provider: str, default: str) -> tuple[float, float]:
+    """Read "input,output" pricing from an env var, falling back to defaults."""
+    raw = os.getenv(f"{provider.upper()}_PRICING_USD_PER_M", default)
+    try:
+        first, _, second = raw.partition(",")
+        return float(first), float(second)
+    except ValueError:
+        return tuple(float(part) for part in default.split(","))
+
+
+MODEL_PRICING_USD_PER_M_TOKENS = {
+    "gemini-3.5-flash": _env_pricing("gemini", "0.30,2.50"),
+    "gemini-3.5-flash-lite": _env_pricing("gemini-lite", "0.10,0.40"),
+    "openai-gpt-5-mini": _env_pricing("openai", "0.25,2.00"),
+}
+
+
+def cost_cents_for(model: str, input_tokens: int, output_tokens: int) -> int | None:
+    """Estimated cost in cents for one set of token counts, or None if unknown.
+
+    Tokens and prices are per-model, so a call rotated to another provider must
+    always be recorded under the model actually used - never averaged across
+    models.
+    """
+    price = MODEL_PRICING_USD_PER_M_TOKENS.get(model)
+    if price is None:
+        return None
+    per_m_input, per_m_output = price
+    return round(
+        (input_tokens * per_m_input + output_tokens * per_m_output) / 10_000
+    )
+
 
 
 # --- Provider registry -------------------------------------------------------

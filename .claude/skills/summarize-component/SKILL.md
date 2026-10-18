@@ -1,6 +1,6 @@
 ---
 name: summarize-component
-description: Use when the user asks for one frontend engineering handoff note, current-status breadcrumb, or compact summary for a single component, bug, accessibility issue, or implementation thread. Triggers on phrases like "handoff note", "TL;DR this thread", "what's the status", or "where does this stand?", even if the user never says "summarize". Do NOT use for drafting customer-facing replies, triaging multiple tickets, reporting aggregate metrics, or creating generic documentation.
+description: Use when the user asks for a written note, handoff note, rundown, TL;DR, or current-status summary about ONE frontend component, bug, or accessibility issue. Triggers on "handoff note", "rundown", "TL;DR this thread", "what's the status", "where does this stand", "summarize this component", and "give me a note on this before I hand it off", even when the user never says "summarize". A request for a written NOTE or SUMMARY belongs here even when it mentions escalating, handing off, or a deadline. Do NOT use for packaging an unresolved issue for another engineer to act on (that is escalate-review), for drafting customer-facing replies, for triaging a batch of items, or for aggregate metrics.
 ---
 
 # Summarize Component
@@ -20,6 +20,11 @@ Create a concise engineering handoff for exactly one item.
 4. Name blockers explicitly rather than implying progress.
 5. Do not invent tests, reviews, or customer feedback that were not supplied.
 6. Keep the handoff under 220 words unless the user asks for detail.
+7. **Publish the handoff for the next skill.** When a sandbox filesystem is
+   available, write the finished note to `.agents/handoff/<component-slug>.md`
+   so another skill can pick it up without re-collecting context. When there is
+   no filesystem, save it with `save_task` (metadata `"type": "handoff"`)
+   instead, so `lookup_task` can still find it.
 
 ## When to escalate instead
 If the item has already had a real build attempt and shows an unresolved
