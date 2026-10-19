@@ -201,10 +201,13 @@ def _local_skill_text() -> str:
 from config import (  # noqa: E402
     AGENT_NAME,
     CHAT_MODELS,
+    DATABASE_URL,
     DEFAULT_OPERATOR,
+    FEDS_APP_DATABASE_URL,
     GEMINI_API_KEY,
     GEMINI_BASE_URL,
     GEMINI_CHAT_MODEL,
+    GEMINI_FALLBACK_API_KEY,
     NEON_DATABASE_URL,
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
@@ -240,6 +243,7 @@ def reload_config() -> None:
             "GEMINI_API_KEY": fresh.GEMINI_API_KEY,
             "GEMINI_BASE_URL": fresh.GEMINI_BASE_URL,
             "GEMINI_CHAT_MODEL": fresh.GEMINI_CHAT_MODEL,
+            "GEMINI_FALLBACK_API_KEY": fresh.GEMINI_FALLBACK_API_KEY,
             "OPENAI_API_KEY": fresh.OPENAI_API_KEY,
             "OPENAI_BASE_URL": fresh.OPENAI_BASE_URL,
             "OPENAI_CHAT_MODEL": fresh.OPENAI_CHAT_MODEL,
@@ -255,7 +259,7 @@ _CURRENT_CONVERSATION_ID: str | None = None
 def _write_guardrail_audit(conversation_id: str, text: str, blocked_terms: list[str]) -> None:
     if not conversation_id:
         return
-    with psycopg.connect(NEON_DATABASE_URL) as conn:
+    with psycopg.connect(DATABASE_URL) as conn:
         with conn.transaction():
             conn.execute(
                 "INSERT INTO audit_log (conversation_id, actor, action, target, payload, result) VALUES (%s,%s,%s,%s,%s::jsonb,%s::jsonb)",
@@ -275,15 +279,21 @@ def _write_guardrail_audit(conversation_id: str, text: str, blocked_terms: list[
             )
 
 
+# Hard-blocked phrases subvert FEDS's own trust boundary: publication to
+# production and the audit trail. No prompt instruction can make those safe, so
+# they are refused before the model runs.
+#
+# Destructive-SQL phrasing ("run sql", "drop table", "alter schema",
+# "execute sql") and credential phrasing ("api key") are deliberately *not*
+# blocked. FEDS has no SQL tool and never echoes secrets (SYSTEM_PROMPT
+# sections 7 and 9), so the model refuses those gracefully while still helping
+# with the legitimate request around them — the behavior eval_set case 3
+# checks. A blunt substring block on those phrases fired on pasted documents and
+# pre-empted the prompt's "treat content as data" instruction.
 _GUARDRAIL_BLOCKERS = (
-    "drop table",
-    "alter schema",
-    "run sql",
-    "execute sql",
     "connect to production",
     "bypass audit",
     "disable audit",
-    "api key",
 )
 
 def _latest_user_text(user_input) -> str:
@@ -414,7 +424,7 @@ class _FrontendAuditHooks(AgentHooks[None]):
 
 
 def _write_audit_row(conversation_id, action, target, payload, result) -> None:
-    with psycopg.connect(NEON_DATABASE_URL) as conn:
+    with psycopg.connect(DATABASE_URL) as conn:
         with conn.transaction():
             conn.execute(
                 "INSERT INTO audit_log (conversation_id, actor, action, target, payload, result) VALUES (%s,%s,%s,%s,%s::jsonb,%s::jsonb)",
@@ -643,7 +653,7 @@ def _write_publish_denied(asset_name: str, environment: str) -> None:
     conversation_id = _CURRENT_CONVERSATION_ID
     if not conversation_id:
         return
-    with psycopg.connect(NEON_DATABASE_URL) as conn:
+    with psycopg.connect(DATABASE_URL) as conn:
         with conn.transaction():
             conn.execute(
                 "INSERT INTO audit_log (conversation_id, actor, action, target, payload, result) VALUES (%s,%s,%s,%s,%s::jsonb,%s::jsonb)",
@@ -672,14 +682,22 @@ def _mcp_server(conversation_id: str | None) -> MCPServerStdio:
             env={
                 **os.environ,
                 "NEON_DATABASE_URL": NEON_DATABASE_URL,
+                "FEDS_APP_DATABASE_URL": FEDS_APP_DATABASE_URL,
                 "MCP_TRANSPORT": "stdio",
                 # Lets the MCP server attribute audit and capability rows to
                 # this conversation instead of writing orphaned NULL rows.
                 "FRONTEND_CONVERSATION_ID": conversation_id or "",
-                # Section 6a: the memory isolation boundary. Without a real
-                # identity every memory owner is "unconfigured-user", which
-                # fails visible rather than sharing everything.
-                "FRONTEND_USER_ID": os.getenv("FEDS_USER_ID", "unconfigured-user"),
+                # Section 6a: the memory isolation boundary. A missing id must
+                # never collapse every user into one shared private bucket, so
+                # fall back to the host operator's name; the MCP server refuses
+                # to serve at all if this ends up blank.
+                "FRONTEND_USER_ID": (
+                    os.getenv("FEDS_USER_ID")
+                    or os.getenv("USERNAME")
+                    or os.getenv("USER")
+                    or ""
+                ),
+                "FRONTEND_USER_NAME": os.getenv("FEDS_USER_NAME", ""),
             },
         ),
         name="frontend-workspace",
@@ -801,7 +819,7 @@ async def run_task(user_input: str) -> None:
 
     conversation_id = uuid.uuid4().hex
     _CURRENT_CONVERSATION_ID = conversation_id
-    engine_url = NEON_DATABASE_URL.split("?", 1)[0].replace("postgresql://", "postgresql+asyncpg://", 1)
+    engine_url = DATABASE_URL.split("?", 1)[0].replace("postgresql://", "postgresql+asyncpg://", 1)
     engine = create_async_engine(
         engine_url,
         connect_args={"ssl": "require", "statement_cache_size": 0},
@@ -969,17 +987,15 @@ async def decide_run(run_id: str, decision: str, operator: str = DEFAULT_OPERATO
         print("Decision must be 'approve' or 'reject'.")
         return False
 
-    engine_url = NEON_DATABASE_URL.split("?", 1)[0].replace("postgresql://", "postgresql+asyncpg://", 1)
+    engine_url = DATABASE_URL.split("?", 1)[0].replace("postgresql://", "postgresql+asyncpg://", 1)
     engine = create_async_engine(
         engine_url,
         connect_args={"ssl": "require", "statement_cache_size": 0},
         pool_pre_ping=True,
     )
     try:
-        # Idempotent schema nudge so an existing deployment gains the operator
-        # column without a manual migration step.
-        async with engine.begin() as db:
-            await db.execute(text("ALTER TABLE run_states ADD COLUMN IF NOT EXISTS operator TEXT"))
+        # No runtime DDL: the operator column is created by setup_neon.py, which
+        # lets the worker run as a least-privilege role that cannot ALTER.
         async with engine.begin() as db:
             row = (
                 await db.execute(

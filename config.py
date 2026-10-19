@@ -6,10 +6,12 @@ drift between the two processes.
 
 Provider policy
 ---------------
-Two providers are configured so the FTE survives either one running out of
-quota. The preferred provider is tried first; on quota exhaustion the router
-falls back to the other, and control returns automatically once the preferred
-provider's quota resets (see `provider_router.py`).
+Several provider credentials are configured so the FTE survives one running
+out of quota. Two of them are Gemini credentials (a primary and a fallback
+key on the same endpoint and models); the router treats each credential as its
+own provider, so the preferred one is tried first, on quota exhaustion the
+next is used, and control returns automatically once the preferred
+credential's quota resets (see `provider_router.py`).
 
 Only quota/rate-limit failures trigger a rotation. A misconfigured credential or
 a genuine bug is surfaced instead of being silently routed around, so a broken
@@ -91,6 +93,16 @@ GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 GEMINI_NATIVE_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_ENABLED = bool(GEMINI_API_KEY) and os.getenv("GEMINI_ENABLED", "1") != "0"
 
+# Gemini (fallback credential): chat + embeddings on a second key. Same
+# endpoint and same models as the primary, so whichever credential serves, the
+# model label is identical and stored vectors stay comparable. Free-tier quota
+# is per key, so this is a real second path, not a cosmetic one. An empty key
+# keeps the route disabled.
+GEMINI_FALLBACK_API_KEY = os.getenv("GEMINI_FALLBACK_API_KEY", "")
+GEMINI_FALLBACK_ENABLED = bool(GEMINI_FALLBACK_API_KEY) and os.getenv(
+    "GEMINI_FALLBACK_ENABLED", "1"
+) != "0"
+
 # --- Embeddings --------------------------------------------------------------
 
 # Every embedding provider must agree on dimensionality; pgvector columns are
@@ -99,6 +111,7 @@ EMBEDDING_DIMENSIONS = 768
 PREFERRED_EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "gemini").strip().lower()
 EMBEDDING_MODELS = {
     "gemini": GEMINI_EMBEDDING_MODEL,
+    "gemini-fallback": GEMINI_EMBEDDING_MODEL,
     "openai": OPENAI_EMBEDDING_MODEL,
 }
 
@@ -107,6 +120,22 @@ EMBEDDING_MODELS = {
 PROVIDER_COOLDOWN_SECONDS = float(os.getenv("PROVIDER_COOLDOWN_SECONDS", "900"))
 
 NEON_DATABASE_URL = os.getenv("NEON_DATABASE_URL", "")
+
+# --- Runtime database credential ---------------------------------------------
+#
+# `NEON_DATABASE_URL` is the schema owner: `setup_neon.py` uses it to create and
+# migrate the schema. The running worker and MCP server should not hold owner
+# rights, so `setup_neon.py` can also provision a restricted `feds_app` role and
+# its URL goes here. When set, the runtime uses the restricted role and a
+# compromise of the app environment is no longer full database ownership.
+#
+# Unset keeps the owner URL so a single-credential deployment still works; the
+# trade-off is recorded in deployment.md.
+FEDS_APP_DATABASE_URL = os.getenv("FEDS_APP_DATABASE_URL", "")
+
+# What the worker and MCP server actually connect with. Not a secret of its own:
+# it resolves to the restricted role when provided, else the owner.
+DATABASE_URL = FEDS_APP_DATABASE_URL or NEON_DATABASE_URL
 
 
 # --- Operator authorization --------------------------------------------------
@@ -204,6 +233,12 @@ _CHAT_PROVIDERS: dict[str, dict[str, object]] = {
         "base_url": GEMINI_BASE_URL,
         "api_key": GEMINI_API_KEY,
     },
+    "gemini-fallback": {
+        "enabled": GEMINI_FALLBACK_ENABLED,
+        "model": GEMINI_CHAT_MODEL,
+        "base_url": GEMINI_BASE_URL,
+        "api_key": GEMINI_FALLBACK_API_KEY,
+    },
     "openai": {
         "enabled": OPENAI_ENABLED,
         "model": OPENAI_CHAT_MODEL,
@@ -212,8 +247,9 @@ _CHAT_PROVIDERS: dict[str, dict[str, object]] = {
     },
     }
 
-# Preference order for chat. Gemini leads; the rest are ordered fallbacks.
-CHAT_PREFERENCE = ("gemini", "openai")
+# Preference order for chat. Gemini leads; the fallback key covers its quota
+# gaps; anything else is ordered after them.
+CHAT_PREFERENCE = ("gemini", "gemini-fallback", "openai")
 
 CHAT_MODELS = {
     name: {"model": cfg["model"], "base_url": cfg["base_url"], "api_key": cfg["api_key"]}
@@ -221,6 +257,11 @@ CHAT_MODELS = {
 }
 
 ENABLED_FLAGS = {name: bool(cfg["enabled"]) for name, cfg in _CHAT_PROVIDERS.items()}
+
+# Credential per provider, for callers that build their own clients (the MCP
+# server's embedding router). Keyed by provider name so a fallback credential
+# can never be served with the primary's key by accident.
+PROVIDER_API_KEYS = {name: str(cfg["api_key"]) for name, cfg in _CHAT_PROVIDERS.items()}
 
 
 def require_config() -> list[str]:
@@ -235,15 +276,22 @@ def require_config() -> list[str]:
             "NEON_DATABASE_URL is not set. Copy .env.example to .env and fill it in, "
             "then run: uv run python setup_neon.py"
         )
+    if FEDS_APP_DATABASE_URL and FEDS_APP_DATABASE_URL == NEON_DATABASE_URL:
+        problems.append(
+            "FEDS_APP_DATABASE_URL is identical to NEON_DATABASE_URL, so the runtime "
+            "still holds the schema owner credential. Point it at the restricted "
+            "role created by setup_neon.py (FEDS_APP_DB_PASSWORD), or unset it."
+        )
     if not chat_order():
         problems.append(
-            "No chat provider is enabled. Set GEMINI_API_KEY (or OPENAI_API_KEY) "
-            "in .env or the environment."
+            "No chat provider is enabled. Set GEMINI_API_KEY (a second Gemini key "
+            "can be added as GEMINI_FALLBACK_API_KEY) in .env or the environment."
         )
     if not problems and not embedding_order():
         problems.append(
-            "No embedding provider is enabled. GEMINI_API_KEY or OPENAI_API_KEY "
-            "must be set, because embeddings need a provider of their own."
+            "No embedding provider is enabled. GEMINI_API_KEY (or "
+            "GEMINI_FALLBACK_API_KEY) must be set, because embeddings need a "
+            "provider of their own."
         )
     return problems
 

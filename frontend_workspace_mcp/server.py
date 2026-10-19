@@ -24,12 +24,17 @@ _EMBEDDING_ROUTER: ProviderRouter | None = None
 from config import (
     EMBEDDING_DIMENSIONS,
     EMBEDDING_MODELS as _EMBEDDING_MODELS,
+    # Kept as module attributes so test_config's credential-parity check can
+    # compare this process's copy against config's; calls use the per-provider
+    # key from PROVIDER_API_KEYS.
+    DATABASE_URL,
     GEMINI_API_KEY,
     GEMINI_EMBEDDING_MODEL,
     GEMINI_NATIVE_BASE_URL as GEMINI_BASE_URL,
     NEON_DATABASE_URL,
     OPENAI_API_KEY,
     OPENAI_EMBEDDING_MODEL,
+    PROVIDER_API_KEYS as _PROVIDER_API_KEYS,
     PROVIDER_COOLDOWN_SECONDS,
     embedding_order as _embedding_order,
 )
@@ -46,7 +51,10 @@ def embedding_router() -> ProviderRouter:
                 Provider(
                     name=name,
                     cooldown_seconds=PROVIDER_COOLDOWN_SECONDS,
-                    metadata={"model": _EMBEDDING_MODELS[name]},
+                    metadata={
+                        "model": _EMBEDDING_MODELS[name],
+                        "api_key": _PROVIDER_API_KEYS.get(name, ""),
+                    },
                 )
                 for name in _embedding_order()
             ],
@@ -69,10 +77,10 @@ def _validate(vector: list[float], provider_name: str) -> list[float]:
     return vector
 
 
-def _embed_openai(texts: list[str]) -> list[list[float]]:
+def _embed_openai(texts: list[str], api_key: str) -> list[list[float]]:
     from openai import OpenAI
 
-    response = OpenAI(api_key=OPENAI_API_KEY).embeddings.create(
+    response = OpenAI(api_key=api_key).embeddings.create(
         model=OPENAI_EMBEDDING_MODEL,
         input=texts,
         dimensions=EMBEDDING_DIMENSIONS,
@@ -81,9 +89,9 @@ def _embed_openai(texts: list[str]) -> list[list[float]]:
     return [_validate([float(v) for v in item.embedding], "openai") for item in ordered]
 
 
-def _embed_gemini(texts: list[str]) -> list[list[float]]:
+def _embed_gemini(texts: list[str], api_key: str) -> list[list[float]]:
     """Batch embed through Gemini's batchEmbedContents endpoint."""
-    url = f"{GEMINI_BASE_URL}/models/{GEMINI_EMBEDDING_MODEL}:batchEmbedContents?key={GEMINI_API_KEY}"
+    url = f"{GEMINI_BASE_URL}/models/{GEMINI_EMBEDDING_MODEL}:batchEmbedContents?key={api_key}"
     body = {
         "requests": [
             {
@@ -116,7 +124,13 @@ def _embed_texts_sync(texts: list[str], provider_name: str) -> list[list[float]]
     if not texts:
         return []
     cleaned = [text.strip()[:8000] or " " for text in texts]
-    return _EMBED_FNS[provider_name](cleaned)
+    # "gemini-fallback" is the same client family as "gemini" on a second key,
+    # so the credential rotates without the model label ever changing.
+    family = provider_name.split("-", 1)[0]
+    embed = _EMBED_FNS.get(family)
+    if embed is None:
+        raise RuntimeError(f"no embedding implementation for provider {provider_name!r}")
+    return embed(cleaned, _PROVIDER_API_KEYS.get(provider_name, ""))
 
 
 async def _embed_texts(
@@ -221,7 +235,7 @@ async def _pool() -> asyncpg.Pool:
     global _POOL
     if _POOL is None:
         _POOL = await asyncpg.create_pool(
-            NEON_DATABASE_URL,
+            DATABASE_URL,
             min_size=1,
             max_size=5,
             statement_cache_size=0,
@@ -812,34 +826,80 @@ GLOBAL_OWNER = "-"
 promotion only, and never deletable: the shared corpus must stay auditable."""
 
 
+class IdentityError(RuntimeError):
+    """Raised when no per-user identity is configured.
+
+    Serving under one anonymous identity is how private memory leaks between
+    users, so the server refuses rather than falling back to a shared bucket.
+    """
+
+
+def _identity_variants() -> list[str]:
+    """Every configured spelling of this user's identity.
+
+    `FRONTEND_USER_ID` is the isolation key; `FRONTEND_USER_NAME` is the
+    display name the sanitizer must also refuse. Values shorter than three
+    characters are ignored so a stub id cannot match unrelated text.
+    """
+    raw = [os.getenv("FRONTEND_USER_ID", ""), os.getenv("FRONTEND_USER_NAME", "")]
+    return [value.strip() for value in raw if len(value.strip()) >= 3]
+
+
 def _requester() -> str:
     """The user this MCP process serves; the isolation boundary.
-    The worker injects `FRONTEND_USER_ID` alongside the conversation id, so a
-    misconfigured deployment fails closed to one clearly-named identity instead
-    of silently sharing everything."""
-    return os.getenv("FRONTEND_USER_ID") or "unconfigured-user"
+
+    The worker injects `FRONTEND_USER_ID` alongside the conversation id. With
+    no identity the server fails closed by refusing to serve, instead of
+    silently merging every user into one private bucket.
+    """
+    user_id = (os.getenv("FRONTEND_USER_ID") or "").strip()
+    if not user_id:
+        raise IdentityError(
+            "FRONTEND_USER_ID is not configured; refusing to serve personal memory"
+        )
+    return user_id
 
 
 _SECRET_MARKERS = re.compile(
     r"(api[_-]?key|token|password|secret|bearer)\s*[=:]\s*\S", re.I
 )
 
+# Code-shaped material that must not travel to the shared layer. A promoted
+# lesson is framework-level knowledge, not someone's implementation: the FTE is
+# expected to rewrite it as prose and pass that as `sanitized_body`. This is a
+# backstop against a raw implementation slipping through, not a code parser.
+_CODE_MARKERS = (
+    re.compile(r"```"),  # a fenced code block
+    re.compile(r"^\s*(?:import|export|const|let|var|function|class)\s", re.M),
+    re.compile(r"\brequire\s*\("),
+    re.compile(r"<[A-Z][A-Za-z0-9]*[\s/>]"),  # JSX / component tag
+    re.compile(r"(?:\.{1,2}/|[A-Za-z]:\\|\\\\)"),  # local or absolute path
+)
 
-def _assert_sanitizable(body: str, requester: str) -> None:
-    """Reject a promotion past the sanitized gate before humans touch it.
 
-    Automated gates can only catch the obvious: the author's own identity
-    embedded in the text, or a credential-shaped assignment. Everything else is
-    the human approver's judgement, enforced by the approval gate on the tool.
+def _assert_sanitizable(body: str) -> None:
+    """Refuse a promotion body that still carries identity, secrets, or code.
+
+    Identity and credentials are whole-token checks; code is a heuristic
+    backstop. All three run before the human sees the request, so only prose the
+    FTE wrote for publication can reach the shared layer.
     """
-    if requester and requester.lower() in body.lower():
-        raise PermissionError(
-            "memory contains the author's identity; sanitize it before promoting"
-        )
+    lowered = body.lower()
+    for variant in _identity_variants():
+        if re.search(rf"(?<![a-z0-9]){re.escape(variant.lower())}(?![a-z0-9])", lowered):
+            raise PermissionError(
+                "memory contains the author's identity; sanitize it before promoting"
+            )
     if _SECRET_MARKERS.search(body):
         raise PermissionError(
             "memory looks like it carries a credential; sanitize it before promoting"
         )
+    for marker in _CODE_MARKERS:
+        if marker.search(body):
+            raise PermissionError(
+                "memory still looks like code; rewrite it as framework-level "
+                "prose before promoting"
+            )
 
 
 @mcp.tool()
@@ -967,10 +1027,116 @@ async def delete_memory(memory_id: str) -> dict[str, Any]:
         return {"deleted": True, "memory_id": memory_id}
 
 
+# The two writes a promotion performs, kept as constants so the schema smoke can
+# execute the exact statements against the live database (inside a rollback).
+# The global insert must carry `promoted_by`; the provenance constraint rejects
+# a shared row that does not.
+_PROMOTE_ORIGIN_SQL = """
+UPDATE memories
+SET status = 'promoted', verification = $2, promoted_by = $3, promoted_at = now()
+WHERE id = $1
+"""
+
+_PROMOTE_GLOBAL_SQL = """
+INSERT INTO memories
+    (scope, owner, body, metadata, verification, promoted_by, promoted_at)
+VALUES ('global', $1, $2, $3::jsonb, $4, $5, now())
+RETURNING id
+"""
+
+
+async def _promote_memory_in(
+    conn: Any, memory_id: str, sanitized_body: str, verification: str
+) -> dict[str, Any]:
+    """The promotion transaction body, on a caller-provided connection.
+
+    Split out of the tool so the schema smoke can run the exact writes inside a
+    transaction it rolls back -- proving the committed path end to end without
+    leaving a shared row behind.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT id, scope, owner, body, metadata, status
+        FROM memories
+        WHERE id = $1
+          AND scope = 'private'
+          AND owner = $2
+          AND status = 'active'
+        FOR UPDATE
+        """,
+        uuid.UUID(memory_id) if memory_id else uuid.UUID(int=0),
+        _requester(),
+    )
+    if row is None:
+        raise PermissionError(
+            "active private memory not found for this user; nothing was promoted"
+        )
+    metadata = _as_dict(row["metadata"])
+    if metadata.get("project_specific"):
+        raise PermissionError(
+            "memory is marked project_specific; generalizable lessons only"
+        )
+    if metadata.get("generalizable") is not True:
+        raise PermissionError(
+            "memory is not flagged generalizable; set metadata "
+            "generalizable=true on framework-level lessons before promoting"
+        )
+    _assert_sanitizable(sanitized_body)
+
+    provenance = {
+        "promoted_from": str(row["id"]),
+        "promoted_by": os.getenv("MEMORY_PROMOTED_BY") or _requester(),
+        "verification": verification,
+        "sanitized_by_gate": True,
+        "source_chars": len(row["body"]),
+        "shared_chars": len(sanitized_body),
+    }
+    await conn.execute(
+        _PROMOTE_ORIGIN_SQL,
+        row["id"],
+        verification,
+        provenance["promoted_by"],
+    )
+    global_id = await conn.fetchval(
+        _PROMOTE_GLOBAL_SQL,
+        GLOBAL_OWNER,
+        sanitized_body,
+        json.dumps(provenance),
+        verification,
+        provenance["promoted_by"],
+    )
+    await conn.execute(
+        """
+        INSERT INTO audit_log
+            (conversation_id, actor, action, target, payload, result)
+        VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb)
+        """,
+        _conversation_id(),
+        "mcp:frontend-workspace",
+        "capability_invoked",
+        "memories",
+        json.dumps(
+            {
+                "tool": "promote_memory",
+                "memory_id": memory_id,
+                "verified_by": verification,
+            }
+        ),
+        json.dumps({"global_id": str(global_id)}),
+    )
+    return {
+        "promoted": True,
+        "global_id": str(global_id),
+        "verification": verification,
+    }
+
+
 @mcp.tool(
     annotations={"read_only_hint": False, "destructive_hint": False, "idempotent_hint": False}
 )
-async def promote_memory(memory_id: str, verification: str) -> dict[str, Any]:
+async def promote_memory(
+    memory_id: str, sanitized_body: str, verification: str
+) -> dict[str, Any]:
     """Promote one private memory to the shared global layer.
 
     Like `publish_task`, this is the human-gated write: it pauses for approval
@@ -978,114 +1144,55 @@ async def promote_memory(memory_id: str, verification: str) -> dict[str, Any]:
 
     1. verified - recorded by the `verification` argument (a reviewer's name,
        an eval id, or an automated check), not merely asserted;
-    2. generalizable - refused when the author flagged the lesson
-       `project_specific`;
-    3. sanitized - identity and credential-shaped text is refused outright.
+    2. generalizable - the lesson must be flagged `generalizable` and must not
+       be flagged `project_specific`;
+    3. sanitized - `sanitized_body` is the FTE's framework-level rewrite. The
+       raw private body never leaves the private layer, and identity,
+       credential-shaped text, and code are refused outright.
 
     Needs `FRONTEND_USER_ID`-independent human attribution, which the approval
     operator supplies when resuming.
     """
     memory_id = memory_id.strip()
+    sanitized_body = sanitized_body.strip()
     verification = verification.strip()
     if not verification:
         raise ValueError(
             "verification is required: record who or what verified this lesson"
         )
-
+    if not sanitized_body:
+        raise ValueError(
+            "sanitized_body is required: rewrite the lesson as framework-level "
+            "prose with no user code, names, or identifiers, then promote that"
+        )
     async with _invocation(
         "promote_memory", {"memory_id": memory_id, "verified_by": verification}
     ):
         pool = await _pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
-                row = await conn.fetchrow(
-                    """
-                    SELECT id, scope, owner, body, metadata, status
-                    FROM memories
-                    WHERE id = $1
-                      AND scope = 'private'
-                      AND owner = $2
-                      AND status = 'active'
-                      FOR UPDATE
-                    """,
-                    uuid.UUID(memory_id) if memory_id else uuid.UUID(int=0),
-                    _requester(),
+                return await _promote_memory_in(
+                    conn, memory_id, sanitized_body, verification
                 )
-                if row is None:
-                    raise PermissionError(
-                        "active private memory not found for this user; "
-                        "nothing was promoted"
-                    )
-                metadata = _as_dict(row["metadata"])
-                if metadata.get("project_specific"):
-                    raise PermissionError(
-                        "memory is marked project_specific; generalizable lessons only"
-                    )
-                _assert_sanitizable(row["body"], _requester())
-
-                provenance = {
-                    "promoted_from": str(row["id"]),
-                    "promoted_by": os.getenv("MEMORY_PROMOTED_BY") or _requester(),
-                    "verification": verification,
-                    "sanitized_by_gate": True,
-                }
-                await conn.execute(
-                    """
-                    UPDATE memories
-                    SET status = 'promoted', verification = $2, promoted_by = $3,
-                        promoted_at = now()
-                    WHERE id = $1
-                    """,
-                    row["id"],
-                    verification,
-                    provenance["promoted_by"],
-                )
-                global_id = await conn.fetchval(
-                    """
-                    INSERT INTO memories
-                        (scope, owner, body, metadata, verification)
-                    VALUES ('global', $1, $2, $3::jsonb, $4)
-                    RETURNING id
-                    """,
-                    GLOBAL_OWNER,
-                    row["body"],
-                    json.dumps(provenance),
-                    verification,
-                )
-                await conn.execute(
-                    """
-                    INSERT INTO audit_log
-                        (conversation_id, actor, action, target, payload, result)
-                    VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb)
-                    """,
-                    _conversation_id(),
-                    "mcp:frontend-workspace",
-                    "capability_invoked",
-                    "memories",
-                    json.dumps(
-                        {
-                            "tool": "promote_memory",
-                            "memory_id": memory_id,
-                            "verified_by": verification,
-                        }
-                    ),
-                    json.dumps({"global_id": str(global_id)}),
-                )
-        return {
-            "promoted": True,
-            "global_id": str(global_id),
-            "verification": verification,
-        }
 
 
 def main() -> None:
-    transport = os.getenv("MCP_TRANSPORT", "streamable-http")
+    # Default to stdio: the worker spawns this server as a child process, and
+    # promotion approval is enforced by the worker, so a network endpoint is a
+    # bypass unless it is deliberately opted into.
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
     if transport == "stdio":
         mcp.run(transport="stdio")
-    else:
-        host = os.getenv("MCP_HOST", "127.0.0.1")
-        port = int(os.getenv("MCP_PORT", "8001"))
-        mcp.run(transport="streamable-http", host=host, port=port, path="/mcp")
+        return
+    host = os.getenv("MCP_HOST", "127.0.0.1")
+    if host not in {"127.0.0.1", "::1", "localhost"} and os.getenv("MCP_ALLOW_REMOTE") != "1":
+        raise SystemExit(
+            f"refusing to bind MCP_HOST={host!r}: promotion approval is enforced "
+            "in the worker, so a remote MCP endpoint would bypass it. Bind "
+            "loopback, or set MCP_ALLOW_REMOTE=1 only behind an authenticating proxy."
+        )
+    port = int(os.getenv("MCP_PORT", "8001"))
+    mcp.run(transport="streamable-http", host=host, port=port, path="/mcp")
 
 
 if __name__ == "__main__":

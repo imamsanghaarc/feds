@@ -78,12 +78,18 @@ def _gemini_status(key: str):
         return -1, f"{type(exc).__name__}: {exc}"
 
 
-# Each probe is a real model call, so keep one per configured provider.
-_PROBES = {
-    "openai": lambda: openai_status(config.OPENAI_API_KEY),
-    "gemini": lambda: _gemini_status(config.GEMINI_API_KEY),
-}
+# Each probe is a real model call, so only configured credentials are probed.
+_PROBES = {}
+if config.GEMINI_API_KEY:
+    _PROBES["gemini"] = lambda: _gemini_status(config.GEMINI_API_KEY)
+if config.GEMINI_FALLBACK_API_KEY:
+    _PROBES["gemini-fb"] = lambda: _gemini_status(config.GEMINI_FALLBACK_API_KEY)
+if config.OPENAI_API_KEY:
+    _PROBES["openai"] = lambda: openai_status(config.OPENAI_API_KEY)
 
+unconfigured = [name for name, on in config.ENABLED_FLAGS.items() if not on]
+if unconfigured:
+    print("not configured: " + ", ".join(unconfigured) + " (probe skipped)")
 print("enabled flags : " + ", ".join(
     f"{name}={'on' if on else 'off'}" for name, on in config.ENABLED_FLAGS.items()
 ))

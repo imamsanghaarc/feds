@@ -1,10 +1,11 @@
 """Prove chat fallback with a genuine 429 from the primary provider.
 
 A local stub server returns HTTP 429 for every chat request, standing in for a
-provider whose quota is exhausted. The real OpenAI provider must then serve the
-turn, and the router must show the primary in cooldown.
+provider whose quota is exhausted. The configured fallback credential
+(`gemini-fallback`, the second Gemini key) must then serve the turn, and the
+router must show the primary in cooldown.
 
-This also confirms a misconfigured credential (HTTP 400) is NOT silently routed
+This also confirms a misconfigured credential (HTTP 401) is NOT silently routed
 around, so a broken key can never masquerade as a healthy system.
 """
 
@@ -71,16 +72,21 @@ async def call(model) -> object:
 
 
 def build_with_quota_exhausted_primary(stub_base_url: str) -> worker.FallbackChatModel:
-    """FallbackChatModel whose primary returns 429 for everything."""
-    original_gemini_url = worker.GEMINI_BASE_URL
-    original_gemini_key = worker.GEMINI_API_KEY
-    worker.GEMINI_BASE_URL = stub_base_url
-    worker.GEMINI_API_KEY = "stub-key"
+    """FallbackChatModel whose primary returns 429 for everything.
+
+    `build_model()` reads its per-provider settings from CHAT_MODELS, so the
+    stub has to patch the entry there (restored immediately after).
+    """
+    original = dict(worker.CHAT_MODELS["gemini"])
+    worker.CHAT_MODELS["gemini"] = {
+        **original,
+        "base_url": stub_base_url,
+        "api_key": "stub-key",
+    }
     try:
         return worker.build_model()
     finally:
-        worker.GEMINI_BASE_URL = original_gemini_url
-        worker.GEMINI_API_KEY = original_gemini_key
+        worker.CHAT_MODELS["gemini"] = original
 
 
 async def main() -> int:
@@ -104,22 +110,31 @@ async def main() -> int:
             if entry["last_error"]:
                 print(f"               {entry['last_error'][:110]}")
 
-        if served != "openai":
-            print(f"[FAIL] expected fallback to openai, got {served}")
+        if served != [n for n in model._provider_names if n != "gemini"][0]:
+            print(f"[FAIL] expected fallback to {model._provider_names}, got {served}")
             failures += 1
         elif not response.output:
             print("[FAIL] fallback produced no output")
             failures += 1
         else:
-            print("[PASS] quota-exhausted primary -> openai served the turn")
+            print("[PASS] quota-exhausted primary -> fallback served the turn")
     finally:
         server.shutdown()
 
-    # A bad credential (400) must surface, not be silently routed around.
-    original = worker.GEMINI_API_KEY
-    worker.GEMINI_API_KEY = "definitely-not-a-valid-key"
+    # A bad credential (401) must surface, not be silently routed around.
+    original = dict(worker.CHAT_MODELS["gemini"])
+    worker.CHAT_MODELS["gemini"] = {
+        **original,
+        "api_key": "definitely-not-a-valid-key",
+    }
     try:
         strict = worker.build_model()
+        # Clear any cooldown the 429 stub left on the primary so the
+        # misconfigured key is genuinely the credential under test.
+        primary = strict._chat_router.get("gemini")
+        if primary is not None:
+            primary.cooldown_until = 0.0
+            primary.failure_streak = 0
         try:
             await call(strict)
             print("[FAIL] a misconfigured key was silently routed around")
@@ -127,7 +142,7 @@ async def main() -> int:
         except Exception as exc:
             print(f"[PASS] misconfigured credential surfaced clearly: {type(exc).__name__}")
     finally:
-        worker.GEMINI_API_KEY = original
+        worker.CHAT_MODELS["gemini"] = original
 
     return 1 if failures else 0
 

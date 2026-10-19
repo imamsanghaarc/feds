@@ -20,12 +20,31 @@ from frontend_workspace_mcp import server as mcp_server
 def check_shared_config() -> None:
     assert mcp_server.NEON_DATABASE_URL == config.NEON_DATABASE_URL
     assert worker.NEON_DATABASE_URL == config.NEON_DATABASE_URL
+    # The runtime credential resolves from one place in both processes, so a
+    # restricted role can never be active in one process and not the other.
+    assert config.DATABASE_URL == (config.FEDS_APP_DATABASE_URL or config.NEON_DATABASE_URL)
+    assert mcp_server.DATABASE_URL == config.DATABASE_URL
+    assert worker.DATABASE_URL == config.DATABASE_URL
+    if config.FEDS_APP_DATABASE_URL:
+        assert config.FEDS_APP_DATABASE_URL != config.NEON_DATABASE_URL, (
+            "FEDS_APP_DATABASE_URL duplicates the owner URL; the runtime would "
+            "hold owner rights and the least-privilege role would be unused"
+        )
+        assert config.DATABASE_URL == config.FEDS_APP_DATABASE_URL
+        print("[INFO] runtime uses the restricted FEDS_APP_DATABASE_URL credential")
+    else:
+        print("[WARN] FEDS_APP_DATABASE_URL is unset; the runtime holds the owner "
+              "credential (see deployment.md)")
     assert mcp_server.OPENAI_API_KEY == config.OPENAI_API_KEY
     assert mcp_server.GEMINI_API_KEY == config.GEMINI_API_KEY
     assert mcp_server.GEMINI_EMBEDDING_MODEL == config.GEMINI_EMBEDDING_MODEL
     assert mcp_server.OPENAI_EMBEDDING_MODEL == config.OPENAI_EMBEDDING_MODEL
     assert worker.HARDCODED_API_KEY == config.OPENAI_API_KEY
     assert worker.GEMINI_API_KEY == config.GEMINI_API_KEY
+    assert worker.GEMINI_FALLBACK_API_KEY == config.GEMINI_FALLBACK_API_KEY
+    assert mcp_server._PROVIDER_API_KEYS.get("gemini-fallback") == (
+        config.GEMINI_FALLBACK_API_KEY
+    )
     assert mcp_server.EMBEDDING_DIMENSIONS == config.EMBEDDING_DIMENSIONS
     print("[PASS] worker and MCP server read identical configuration")
 
@@ -42,6 +61,7 @@ def check_shape() -> None:
     for name, key in (
         ("openai", config.OPENAI_API_KEY),
         ("gemini", config.GEMINI_API_KEY),
+        ("gemini-fallback", config.GEMINI_FALLBACK_API_KEY),
     ):
         if not key:
             print(f"[SKIP] {name} has no key configured (provider disabled)")
@@ -54,6 +74,13 @@ def check_shape() -> None:
 
     if config.OPENAI_API_KEY:
         assert config.OPENAI_API_KEY.startswith("sk-"), "openai key has unexpected prefix"
+    # Two identical Gemini keys would look like redundancy while sharing one
+    # quota pool - the exact failure this fallback exists to prevent.
+    if config.GEMINI_API_KEY and config.GEMINI_FALLBACK_API_KEY:
+        assert config.GEMINI_FALLBACK_API_KEY != config.GEMINI_API_KEY, (
+            "GEMINI_FALLBACK_API_KEY duplicates GEMINI_API_KEY; "
+            "the fallback would exhaust with the primary"
+        )
     assert config.EMBEDDING_DIMENSIONS == 768
     for provider in config.embedding_order():
         assert provider in config.EMBEDDING_MODELS
@@ -62,6 +89,11 @@ def check_shape() -> None:
     for name, key, enabled in (
         ("openai", config.OPENAI_API_KEY, config.OPENAI_ENABLED),
         ("gemini", config.GEMINI_API_KEY, config.GEMINI_ENABLED),
+        (
+            "gemini-fallback",
+            config.GEMINI_FALLBACK_API_KEY,
+            config.ENABLED_FLAGS.get("gemini-fallback", False),
+        ),
     ):
         if not key:
             assert not enabled, f"{name} is enabled without a credential"
@@ -162,6 +194,7 @@ def check_live_credentials(strict: bool) -> int:
     for name, probe in (
         ("openai", lambda: _openai_key_valid(config.OPENAI_API_KEY)),
         ("gemini", lambda: _gemini_key_valid(config.GEMINI_API_KEY)),
+        ("gemini-fallback", lambda: _gemini_key_valid(config.GEMINI_FALLBACK_API_KEY)),
     ):
         valid, detail = probe()
         if valid:

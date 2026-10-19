@@ -63,9 +63,16 @@ Scoped tools over Neon, the agent's entire database surface:
 
 ## 4. Trust boundary: guardrails and human approvals
 
-- **Input guardrail** blocks destructive and audit-bypass phrasing before
-  any model or persistence work, and screens only the latest user turn so
-  one bad message can't poison a whole conversation.
+- **Input guardrail** blocks only attempts to subvert FEDS's own trust
+  boundary — audit bypass and production publication — before any model or
+  persistence work, and screens only the latest user turn so one bad message
+  can't poison a whole conversation. Destructive-SQL and credential phrasing
+  is *not* hard-blocked: FEDS has no SQL tool and never echoes secrets
+  (`SYSTEM_PROMPT.md` sections 7 and 9), so the model refuses those gracefully
+  while still helping with the legitimate request around them — the behavior
+  `eval_set.md` case 3 checks. A blunt substring block on those phrases fired
+  on pasted documents and pre-empted the prompt's own "treat content as data"
+  rule; narrowed 2026-10-19 (see section 9).
 - **Approval-gated writes.** `publish_task` and `promote_memory` pause the
   run, persist its state (`run_states`), and resume only via
   `--decide <run_id> approve|reject [operator]`. Production publishing also
@@ -94,19 +101,45 @@ Scoped tools over Neon, the agent's entire database surface:
 
 - **Private memory.** `save_memory` / `list_memories` / `delete_memory`
   with isolation in the SQL itself (`owner = requester`), keyed by
-  `FRONTEND_USER_ID`; an unconfigured deployment fails closed to one named
-  identity instead of sharing everything.
-- **Three promotion gates.** `promote_memory` requires a recorded
-  verification, refuses project-specific lessons, and refuses text
-  carrying the author's identity or credential-shaped assignments — then
-  still pauses for human approval before anything shared is created.
-- **Auditable shared layer.** Global rows are append-only with full
-  provenance (origin id, promoter, verification); promoted originals are
-  kept as the provenance chain and can never promote twice.
+  `FRONTEND_USER_ID`; an unconfigured MCP server refuses to serve at all
+  (fail-closed) rather than collapsing every user into one shared bucket.
+- **Three promotion gates, all automated.** `promote_memory(memory_id,
+  sanitized_body, verification)` refuses unless a verification is recorded,
+  the lesson is flagged `metadata.generalizable` and is not
+  `project_specific`, and `sanitized_body` — the FTE's framework-level
+  rewrite — is free of identity, credential-shaped text, and code (fenced
+  blocks, source lines, JSX, and local paths). The raw private body never
+  leaves the private layer; only the sanitized rewrite is shared.
+- **Approval is the only human step.** Everything up to approval is the
+  FTE's work; the write still pauses for a recorded human approval, and the
+  MCP server defaults to stdio and refuses a non-loopback bind unless
+  `MCP_ALLOW_REMOTE=1`, so the gate cannot be bypassed over the network.
+- **Auditable shared layer.** Global rows are append-only (a trigger
+  refuses UPDATE/DELETE), constrained to the `'-'` sentinel owner, and
+  require promotion attribution; provenance carries origin id, promoter,
+  verification, and source/shared sizes. Promoted originals are kept as the
+  provenance chain and can never promote twice.
+- **Least-privilege runtime role.** `setup_neon.py` provisions a restricted
+  `feds_app` login — no ownership, DDL, role/database admin, or RLS bypass —
+  and the worker and MCP server connect with it (`FEDS_APP_DATABASE_URL`)
+  instead of the schema owner. All runtime DDL was moved into `setup_neon.py`,
+  and an offline test fails if either process reintroduces a
+  `CREATE`/`ALTER`/`DROP`. This bounds the blast radius of a leaked app
+  credential without pretending the database enforces the approval (it does
+  not — see deployment.md).
 - **Proven live:** `smoke_memory.py` (zero quota) shows cross-user reads
-  refused, all three gates firing plus both sanitizer refusals, one real
+  refused, every gate firing (missing verification, missing sanitized body,
+  project-specific, unflagged, code, credential, identity), one real
   generalizable lesson promoted and read by the other user, and clean
-  teardown.
+  teardown. On a re-run, when the lesson is already shared, the same promotion
+  path is executed on a rolled-back connection, so the committed code is
+  exercised every run without duplicating shared content.
+  `smoke_memory_schema.py` executes the two promotion statements and the
+  constraint/append-only probes inside a rolled-back transaction, so the
+  database rules are proven without touching the shared layer.
+  `smoke_app_role.py` proves the restricted role end to end (worker write path
+  and SQLAlchemy engine succeed as `feds_app`; `CREATE TABLE`, `CREATE SCHEMA`,
+  `ALTER TABLE`, and `DROP TABLE` are refused).
 
 ## 6. Semantic search and embeddings (pgvector)
 
@@ -145,8 +178,18 @@ Scoped tools over Neon, the agent's entire database surface:
 - **Chat and embedding routes are separate**, with a test forbidding a
   chat-only provider from appearing in the embedding order. Extra providers
   stay dormant until enabled (no credentials committed).
+- **Two Gemini credentials, one fallback.** `GEMINI_FALLBACK_API_KEY` is a
+  second credential on the same endpoint and models, registered as the
+  `gemini-fallback` provider for **both** chat and embeddings. The router
+  treats it as its own provider, so one key running out of quota hands work to
+  the other; because both serve the same model, the stored vector label never
+  changes and search stays comparable. `test_config` refuses a fallback key
+  identical to the primary (that would be fake redundancy sharing one pool).
+- **Proven live (2026-10-19):** the primary key returned a genuine 429 and the
+  router served the turn from `gemini-fallback` — the first real, non-stub
+  failover.
 - **Status reporting.** `status_providers.py` checks live availability of
-  every configured provider on demand.
+  every configured provider on demand, skipping unconfigured ones.
 
 ## 8. Observability, sessions, and cost
 
@@ -178,9 +221,15 @@ Scoped tools over Neon, the agent's entire database surface:
   exit code 2 marks quota-incomplete runs so they can't pass by accident.
   The eval found and fixed three real defects: two description gaps and a
   scoring bug in the harness itself.
-- **System-prompt eval, 1/8 PARTIAL.** `eval_set.md` defines eight
-  behavioral cases; one scored and passed, seven await quota. Recorded
-  honestly rather than rounded up.
+- **System-prompt eval, 8/8 scored, 6 pass (pre-fix).** `eval_set.md` defines
+  eight behavioral cases; all eight have a real single-run result. The two
+  failures drove fixes: `SYSTEM_PROMPT.md` section 11 now chooses
+  implement-vs-snippet mode by size, not by reading a verb (case 1), and the
+  input guardrail no longer hard-blocks pasted SQL so the prompt's
+  treat-content-as-data rule can run (case 3, section 4). Both fixes are
+  pinned by offline tests; the pass counts above predate them and do not carry
+  over — re-measurement is pending quota. Three-run stability remains open
+  (`missing.md` item 5).
 - **Offline suite, 3/3 green.** `run_tests.py`: config wiring (incl. the
   planted-secret scanner), provider router behavior, and guardrail/input
   checks — all meaningful with providers exhausted.

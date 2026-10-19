@@ -24,6 +24,13 @@ thing allowed to touch Neon (pgvector).
   as the single import surface for both the worker and the MCP server. Never
   hard-code or commit them — `test_config.py` carries a planted-secret
   scanner. A deployed process supplies real environment variables instead.
+- Two database credentials. `NEON_DATABASE_URL` is the schema owner and belongs
+  only to `setup_neon.py` and the ingest/migration CLIs. The worker and MCP
+  server connect with `FEDS_APP_DATABASE_URL` (the restricted `feds_app` role);
+  `config.DATABASE_URL` resolves to it and falls back to the owner only when it
+  is unset. Because the runtime role cannot run DDL, all schema changes go in
+  `setup_neon.py` — never add a runtime `CREATE`/`ALTER`/`DROP` (an offline test
+  fails if `worker.py` or `server.py` contains one).
 - Rotate providers on quota exhaustion only; never route around a rejected
   credential or a real bug.
 - Publication requires a recorded human approval first. The approval-gated
@@ -36,10 +43,19 @@ thing allowed to touch Neon (pgvector).
 
 - One-time setup: `uv sync`, copy `.env.example` → `.env`, fill it, then
   `uv run python setup_neon.py` (idempotent schema; re-run after schema
-  edits).
+  edits). Set `FEDS_APP_DB_PASSWORD` in `.env` first to also provision the
+  restricted runtime role.
 - Offline gate before any push: `uv run python run_tests.py` → 3 suites
   (config wiring, provider fallback router, guardrails and inputs). Exits
   non-zero on failure; keep it green.
+- Zero-quota live schema proof: `uv run python smoke_memory_schema.py` runs
+  the real promotion statements and the constraint/append-only probes inside
+  a rolled-back transaction, so the memory rules are proven at the database
+  without touching the shared layer.
+- Zero-quota live privilege proof: `uv run python smoke_app_role.py` proves the
+  runtime role is least-privilege — the worker's write path and the SQLAlchemy
+  engine succeed as `feds_app`, while DDL is refused. Skips when
+  `FEDS_APP_DATABASE_URL` is unset.
 - Fastest single-suite run: `uv run python test_worker_offline.py`.
 - Live checks are quota-consuming and opt-in: set `RUN_LIVE_TESTS=1`
   (PowerShell: `$env:RUN_LIVE_TESTS = "1"`) — that unlocks the live suites
@@ -89,10 +105,15 @@ thing allowed to touch Neon (pgvector).
 - `seed_corpus.py --apply` is idempotent; `verify_corpus.py` must keep
   ranking the confusable pairs first.
 - `FRONTEND_CONVERSATION_ID` and `FRONTEND_USER_ID` are injected by the
-  worker into the MCP server's env; without them audit rows go NULL and
-  memories fall back to `unconfigured-user`.
+  worker into the MCP server's env; without a user id the server fails
+  closed and refuses to serve memory at all — it never falls back to one
+  shared identity.
 - Memory isolation lives in the SQL (`scope = 'private' AND owner = $2`);
-  do not "simplify" those predicates away.
+  do not "simplify" those predicates away. The promotion gates live in
+  `promote_memory` plus the `memories` constraints and append-only trigger in
+  `setup_neon.py`; a promotion needs a recorded verification, a `generalizable`
+  flag, and a clean `sanitized_body`, and the shared copy comes only from that
+  body. Do not weaken either layer.
 - Skills live in `.claude/skills/` (35 of them); `_resolve_skills_root()`
   falls back to `skills/` — a test pins both locations.
 - The parent directory `E:\agency-agents` holds credential-looking files
