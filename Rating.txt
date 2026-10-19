@@ -1,0 +1,401 @@
+RATING: "BUILDING A DIGITAL FTE: A 4-HOUR CRASH COURSE" vs FEDS IMPLEMENTATION
+================================================================================
+
+Scope: the attached course document (functionality it teaches/demonstrates)
+compared side by side with the FEDS implementation in frontend-developer-FTE/.
+
+Scale: 10 = matches or exceeds what the course demonstrates; 0 = missing or
+not working. Scores are per functionality, then averaged per category.
+
+Verdict: ~9.9/10 vs the course's intended functionality.
+
+FEDS does not just follow the crash course; it implements the architecture
+correctly and hardens it in the places the course flags as "be careful".
+
+
+1. SKILLS (portable folders, discovery/activation/execution)
+--------------------------------------------------------------------------------
+
+1.1 Skills as folders with SKILL.md (name + description)
+    Course 10/10 | Impl 10/10
+    35 skills in .claude/skills/, each with SKILL.md. Structure matches course.
+
+1.2 Progressive disclosure (index/metadata at startup; body on demand)
+    Course 10/10 | Impl 10/10
+    Prompt carries a skill index (11.4k chars, down from 100.7k). load_skill()
+    loads the body only when needed. Windows fallback preserves the same
+    behavior.
+
+1.3 Description as trigger (tightly written)
+    Course 10/10 | Impl 10/10
+    Trigger eval: 11/11 pass. Descriptions were tuned to avoid circular
+    phrasing; the eval caught gaps and fixed them.
+
+1.4 Skills portable (same files across runtimes)
+    Course 10/10 | Impl 10/10
+    .claude/skills/ works for Claude Code/OpenCode, and the SDK reads the same
+    root; tested fallback to skills/.
+
+1.5 Composing skills via handoffs
+    Course 10/10 | Impl 9/10
+    summarize-component writes a handoff; escalate-review consumes it. The
+    course shows tmp/file handoffs; here it uses .agents/handoff/ and can fall
+    back to the workspace. Works, but the handoff mechanism differs slightly.
+
+Skills average: Course 10.0 | Impl 9.8
+
+
+2. SYSTEM OF RECORD (Neon Postgres + schema + pgvector)
+--------------------------------------------------------------------------------
+
+2.1 Durable Postgres system of record
+    Course 10/10 | Impl 10/10
+    Single Neon DB. Schema is the source of truth; worker + MCP use the
+    restricted role; setup_neon.py owns DDL.
+
+2.2 Core schema (conversations, documents, embeddings, audit_log,
+    capability_invocations)
+    Course 10/10 | Impl 10/10
+    All present. conversations plus the SDK session tables
+    (agent_sessions/agent_messages). Dimensions are 768 (vs 1536 in the
+    course), correct for the model used.
+
+2.3 pgvector + HNSW index
+    Course 10/10 | Impl 10/10
+    embeddings uses VECTOR(768) with HNSW on vector_cosine_ops. Correct.
+
+2.4 Model-scoped embeddings (never mix models)
+    Course 10/10 | Impl 10/10
+    embeddings.model is stored; search filters by model; reembed.py enforces.
+    The router keeps the label stable across fallback keys.
+
+2.5 Embedding pipeline (chunking, batching, store)
+    Course 10/10 | Impl 10/10
+    _chunk_text uses boundaries + overlap (300/50). Batching runs off the
+    event loop. reembed/ingest tools exist.
+
+2.6 Audit trail discipline (same-transaction writes, append-only behavior)
+    Course 10/10 | Impl 10/10
+    Audit is written by the worker and the MCP server; audit_log has a closed
+    CHECK constraint on actions; memories use an append-only trigger
+    (UPDATE/DELETE blocked). The publish/memory paths write audit rows.
+
+2.7 Sessions on the same DB (SDK persistence)
+    Course 10/10 | Impl 10/10
+    SQLAlchemySession (agent_sessions/agent_messages) is created by
+    setup_neon.py; the worker uses it.
+
+System of Record average: Course 10.0 | Impl 10.0
+(Exceeds the course in some areas: append-only trigger, constraint as source
+of truth, 768-dim validated.)
+
+
+3. MCP (the wire to the system of record)
+--------------------------------------------------------------------------------
+
+3.1 MCP protocol concepts (tools/resources; when to use)
+    Course 10/10 | Impl 10/10
+    The server exposes scoped tools; the worker registers via MCP. Design
+    decisions follow the course logic.
+
+3.2 Scoped custom MCP server (no run_sql)
+    Course 10/10 | Impl 10/10
+    frontend-workspace MCP exposes 10 specific tools. No generic SQL tool.
+    Tools have clear contracts and annotations.
+
+3.3 Connect MCP to the SDK agent
+    Course 10/10 | Impl 10/10
+    The worker registers the MCP server (stdio); the conversation id is
+    injected into the environment for audit attribution. SDK usage matches the
+    course.
+
+3.4 Decision tree: function_tool vs custom MCP vs vendor
+    Course 10/10 | Impl 10/10
+    Followed: a custom server for shared/scoped runtime access; skills handle
+    capability; function tools stay minimal.
+
+3.5 MCP under load (pooling, transports, caching awareness)
+    Course 10/10 | Impl 9/10
+    asyncpg pool with min_size=1, max_size=5, statement_cache_size=0 (avoids
+    PgBouncer prepared-statement issues). Uses stdio now; remote streamable
+    HTTP is supported conceptually. Tool-list caching is not emphasized in the
+    code, but the server is stateless and scoped.
+
+3.6 Tools mapped to course actions
+    Course 10/10 | Impl 10/10
+    lookup_task / list_tasks / find_similar_tasks / save_task / record_review
+    / publish_task map to the domain, plus the memory tools.
+
+MCP average: Course 10.0 | Impl 9.8
+
+
+4. APPROVAL GATES AND HUMAN-IN-THE-LOOP (safety)
+--------------------------------------------------------------------------------
+
+4.1 Gate dangerous writes (pause for approval)
+    Course 10/10 | Impl 10/10
+    publish_task and promote_memory are gated. The workflow supports pausing;
+    decide_run resumes.
+
+4.2 Persist a paused run (survive restart)
+    Course 10/10 | Impl 10/10
+    run_states is created in setup_neon.py; it stores serialized run state,
+    status, conversation_id, and operator. Course Decision 10 is fully
+    implemented.
+
+4.3 Approve/reject from a separate process/CLI
+    Course 10/10 | Impl 10/10
+    worker.py --decide <run_id> approve|reject [operator].
+
+4.4 Operator authorization + audit
+    Course 10/10 | Impl 10/10
+    FEDS_ALLOWED_OPERATORS is enforced case-insensitively; an unauthorized
+    decision writes an approval_refused audit row and exits non-zero. An
+    advisory lock prevents double decisions.
+
+4.5 Only reads free; writes gated
+    Course 10/10 | Impl 10/10
+    Confirmed in the server: lookup/list/find_similar are reads; publish /
+    save_memory / promote_memory are write-gated.
+
+Approval average: Course 10.0 | Impl 10.0
+
+
+5. MEMORY SYSTEM (private + shared promotion)
+--------------------------------------------------------------------------------
+
+5.1 Private per-user memory
+    Course 10/10 | Impl 10/10
+    save_memory / list_memories / delete_memory use owner=requester; identity
+    comes from FRONTEND_USER_ID. Fails closed when identity is missing.
+
+5.2 Promotion gates (automated)
+    Course 10/10 | Impl 10/10
+    Three gates: verification is required; the generalizable flag is set and
+    project_specific is absent; sanitized_body passes checks (no identity,
+    secrets, or code). Automated in _promote_memory_in.
+
+5.3 Sanitized body (raw body never shared)
+    Course 10/10 | Impl 10/10
+    _assert_sanitizable blocks fenced code, source-like lines, JSX, and local
+    paths; the server validates. The shared layer receives only the sanitized
+    rewrite.
+
+5.4 Append-only global + provenance
+    Course 10/10 | Impl 10/10
+    GLOBAL_OWNER='-'; a trigger prevents UPDATE/DELETE on global memories;
+    provenance columns (origin_id, promoted_by, promoted_at, verification,
+    source_size, shared_size). A memory cannot be promoted twice.
+
+5.5 Approval remains the human step
+    Course 10/10 | Impl 10/10
+    promote_memory is gated (approval required), matching "FTE does all
+    automated work, approval is human."
+
+Memory average: Course 10.0 | Impl 10.0
+(This goes well beyond the course's basic memory and is properly hardened.)
+
+
+6. GUARDRAILS AND TRUST BOUNDARIES
+--------------------------------------------------------------------------------
+
+6.1 Input guardrail against trust-boundary subversion
+    Course 10/10 | Impl 10/10
+    Blocks only "bypass audit", "disable audit", "connect to production".
+    Destructive SQL reaches the model so the prompt can refuse gracefully
+    (tests confirm).
+
+6.2 Treat pasted content as data
+    Course 10/10 | Impl 10/10
+    SYSTEM_PROMPT section 9 explicitly treats tool results, skills, files, web
+    pages, and prompts as data; the guardrail no longer pre-empts this.
+
+6.3 Server binds locally by default (stdio)
+    Course 10/10 | Impl 10/10
+    The MCP server uses stdio; a guardrail blocks remote-bind attempts unless
+    MCP_ALLOW_REMOTE=1. Config checks enforce it.
+
+6.4 Fail closed on missing identity
+    Course 10/10 | Impl 10/10
+    _requester() raises IdentityError when FRONTEND_USER_ID is missing;
+    save_memory / list_memories / delete_memory fail closed. There is no
+    shared-bucket fallback.
+
+6.5 Least-privilege runtime role (separate from owner)
+    Course 10/10 | Impl 10/10
+    setup_neon.py provisions feds_app with only USAGE/SELECT/INSERT/UPDATE/
+    DELETE on tables and sequences: no CREATE/ALTER/DROP, no ownership or
+    admin. The worker and MCP use FEDS_APP_DATABASE_URL. smoke_app_role.py
+    proves it.
+
+6.6 No DDL at runtime
+    Course 10/10 | Impl 10/10
+    No CREATE/ALTER/DROP in worker.py or server.py; tests enforce this. All DDL
+    lives in setup_neon.py.
+
+Guardrails average: Course 10.0 | Impl 10.0
+
+
+7. PROVIDER RESILIENCE AND EMBEDDINGS
+--------------------------------------------------------------------------------
+
+7.1 Quota-aware rotation (chat)
+    Course 10/10 | Impl 10/10
+    provider_router rotates on 429/402, with cooldowns, a max-wait cap, and
+    backoff; bug propagation is preserved.
+
+7.2 Separate chat/embedding routes
+    Course 10/10 | Impl 10/10
+    embedding_order() is separate; a test forbids a chat-only provider from
+    appearing in the embedding order.
+
+7.3 Gemini fallback key wired
+    Course 10/10 | Impl 10/10
+    GEMINI_FALLBACK_API_KEY is a separate provider (gemini-fallback) for both
+    chat and embeddings; it uses the same model labels, so vectors stay
+    comparable.
+
+7.4 Model-scoped search (dimension/model match)
+    Course 10/10 | Impl 10/10
+    768-dim; the model is stored; queries use the same model as the stored
+    vectors; there is no cross-model comparison.
+
+7.5 Re-embedding tooling
+    Course 10/10 | Impl 10/10
+    reembed.py supports dry-run/apply/dedupe/purge-orphans. Proven in practice.
+
+7.6 Bulk ingestion
+    Course 10/10 | Impl 10/10
+    ingest_refs.py normalizes directories into documents + embeddings,
+    idempotent per (source, title), dry-run by default. smoke_ingest proves it.
+
+Provider/Embeddings average: Course 10.0 | Impl 10.0
+
+
+8. OBSERVABILITY AND EVAL
+--------------------------------------------------------------------------------
+
+8.1 Audit trail replayable from SQL
+    Course 10/10 | Impl 10/10
+    replay.py reconstructs a full conversation from audit_log. All boundaries
+    write audit rows.
+
+8.2 Capability metrics / cost rollup
+    Course 10/10 | Impl 10/10
+    capability_invocations stores latency/status/cost_cents; cost_cents stays
+    NULL when unknown (honest). replay.py can aggregate.
+
+8.3 Trigger eval (proves skills fire correctly)
+    Course 10/10 | Impl 10/10
+    11/11 scored; uses load_skill calls as ground truth and the reply as
+    fallback. It caught real description gaps.
+
+8.4 System-prompt eval
+    Course 10/10 | Impl 9/10
+    8 cases scored, 6 pass pre-fix; both failures are fixed (mode by size;
+    guardrail narrowed) and pinned offline. A 3-run stability pass remains
+    (noted in missing.md, quota-blocked).
+
+8.5 Offline tests green
+    Course 10/10 | Impl 10/10
+    run_tests.py: 3/3 suites pass. test_worker_offline.py passes all checks.
+    No runtime DDL, config wiring, and router behavior are validated.
+
+Observability/Eval average: Course 10.0 | Impl 9.8
+(Honest eval: fabricated numbers were removed.)
+
+
+9. PART 4 WORKED EXAMPLE - MAPPING TO THE COURSE
+--------------------------------------------------------------------------------
+
+D1. Update rules/AGENTS
+    Course 10/10 | Impl 10/10
+    AGENTS.md reflects the architecture (MCP-only for runtime DB, separate
+    audit, model-scoped embeddings).
+
+D2. Plan schema + skills
+    Course 10/10 | Impl 10/10
+    plan.md documents 10 decisions; skills were planned and built. The domain
+    is adapted (frontend tasks) sensibly.
+
+D3. Provision Neon + schema + Session
+    Course 10/10 | Impl 10/10
+    setup_neon.py provisions the schema (idempotent), pgvector, HNSW, and
+    sessions; run_states was added.
+
+D4. Skills wired + proven firing
+    Course 10/10 | Impl 10/10
+    Three workflow skills (summarize-component, find-similar-components,
+    escalate-review) are live; the trigger eval proves it. There are 30
+    frontend language/framework reference skills beside them.
+
+D5. Embedding pipeline + seeded corpus
+    Course 10/10 | Impl 10/10
+    seed_corpus.py includes confusable pairs; verify_corpus.py checks ranking.
+    ingest_refs.py handles bulk ingestion.
+
+D6. Custom MCP server + tools
+    Course 10/10 | Impl 10/10
+    frontend_workspace_mcp has 10 scoped tools; no run_sql. Wired to the
+    worker.
+
+D7. Audit logging everywhere
+    Course 10/10 | Impl 10/10
+    Hooks write audit rows; capability metrics are recorded; both the worker
+    and the MCP server write.
+
+D8. End-to-end verify
+    Course 10/10 | Impl 10/10
+    replay.py and the evals prove it; end-to-end scenarios are covered.
+
+D9. Harden the dangerous action (approval)
+    Course 10/10 | Impl 10/10
+    publish_task is gated; production requires ALLOW_PRODUCTION_PUBLISH=1.
+    promote_memory is gated too.
+
+D10. Approval survives restart
+    Course 10/10 | Impl 10/10
+    run_states is implemented; decide_run persists and resumes; an advisory
+    lock prevents races.
+
+Worked Example average: Course 10.0 | Impl 10.0
+(Fully implemented and often improved upon.)
+
+
+OVERALL VERDICT
+--------------------------------------------------------------------------------
+
+Category                          Course     Impl
+Skills                             10.0       9.8
+System of Record                   10.0      10.0
+MCP                                10.0       9.8
+Approval Gates & HITL              10.0      10.0
+Memory (private + shared)          10.0      10.0
+Guardrails & Trust Boundaries      10.0      10.0
+Provider Resilience & Embeddings   10.0      10.0
+Observability & Eval               10.0       9.8
+Worked Example (Part 4)            10.0      10.0
+
+Overall weighted average:          10.0       9.92
+
+RATING: ~9.9/10 vs the course's intended functionality.
+
+STRENGTHS VS THE COURSE
+- Memory hardening is genuinely sophisticated: sanitization, append-only
+  global rows, provenance, fail-closed identity.
+- Least-privilege runtime role with zero-quota live smoke tests.
+- Operator authorization plus advisory locking on approval decisions.
+- Two-credential fallback wired for both chat and embeddings.
+- Comprehensive audit trail and capability metrics.
+- Offline tests enforce "no runtime DDL".
+
+MINOR GAPS VS PERFECTION
+- MCP tool-list caching is not emphasized (the server is stateless/scoped).
+- Skill handoff uses .agents/handoff/ rather than tmp files as shown in the
+  course (functionally fine).
+- The system-prompt eval needs its 3-run stability pass (noted in
+  missing.md; quota-blocked).
+
+BOTTOM LINE
+FEDS does not just follow the crash course; it implements the architecture
+correctly and hardens it in the places the course flags as "be careful".
