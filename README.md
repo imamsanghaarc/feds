@@ -2,12 +2,6 @@
 
 **F**rontend **E**ngineering **D**igital **S**pecialist — an AI Employee that
 designs, implements, reviews, and troubleshoots production-grade web interfaces.
-
-FEDS is a Digital FTE built from the *Building a Digital FTE: A 4-Hour Crash
-Course* architecture. It loads frontend skills, saves durable frontend tasks to
-Neon Postgres, searches prior work semantically, and keeps a full audit and
-metrics trail.
-
 ---
 
 ## Quick start
