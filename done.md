@@ -3,7 +3,7 @@
 The founders' overview: what FEDS (Frontend Engineering Digital Specialist)
 does today, feature by feature. Everything here is built, committed, and
 backed by the offline test suite; items proven in a live run also name their
-evidence. What is *not* done lives in `missing.md` (Sanghaar's queue) and
+evidence. What is *not* done lives in `sanghaar.md` (Sanghaar's queue) and
 `muheeb.md` (Muheeb's queue); measured eval numbers live in
 `eval_results.md`.
 
@@ -229,7 +229,7 @@ Scoped tools over Neon, the agent's entire database surface:
   treat-content-as-data rule can run (case 3, section 4). Both fixes are
   pinned by offline tests; the pass counts above predate them and do not carry
   over — re-measurement is pending quota. Three-run stability remains open
-  (`missing.md` item 5).
+  (`sanghaar.md` item 5).
 - **Offline suite, 3/3 green.** `run_tests.py`: config wiring (incl. the
   planted-secret scanner), provider router behavior, and guardrail/input
   checks — all meaningful with providers exhausted.
@@ -259,9 +259,9 @@ Scoped tools over Neon, the agent's entire database surface:
   (the refusal path and its audit row) and `smoke_ingest.py` (ingestion and
   idempotency) exercise real Neon behavior without spending model quota, so
   they keep working when providers are exhausted.
-- **Founder work queues.** `done.md` (this file), `missing.md` (remaining
+- **Founder work queues.** `done.md` (this file), `sanghaar.md` (remaining
   work, Sanghaar), `muheeb.md` (features, Muheeb), and `plan.md` (the ten
   design decisions) keep ownership and status explicit.
 - **Design input.** `FEDS-Self-Learning-Algorithm-Design.docx` (v1.0 draft,
   kept in the repo) specifies the next phase — the Verified Lesson Loop — with
-  a seven-phase roadmap; `missing.md` maps it against what already exists.
+  a seven-phase roadmap; `sanghaar.md` maps it against what already exists.

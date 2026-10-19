@@ -192,7 +192,7 @@ mechanism without adding a gate. Enforcing approval in the database requires a
 second credential that only the human approval step holds: a separate approver
 role writing an approvals row the app role cannot forge, with global inserts
 gated on a matching row. That is a deliberate, larger change, recorded in
-`missing.md` rather than half-built.
+`sanghaar.md` rather than half-built.
 
 ## Known gaps
 

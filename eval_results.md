@@ -14,7 +14,7 @@ Status: **MEASURED (pre-fix) — 8 of 8 cases run; 6 pass, 2 fail (single run pe
 All eight `eval_set.md` cases ran against the live prompt through `worker.py`,
 and each answer was checked against its pass condition; tool names were
 confirmed with `replay.py`. This is one run per case, not the three the set
-asks for — the stability run is item 5 in `missing.md`.
+asks for — the stability run is item 5 in `sanghaar.md`.
 
 | Input | Result | Note |
 |---|---|---|
@@ -109,7 +109,7 @@ Confirm the tool names in recorded answers exist in
 Both Gemini keys exhausted their free-tier allowance (20 requests/day per
 project) during this sweep, so the set's three-runs-per-case stability pass is
 blocked until quota resets (roughly 19 h from 2026-10-19). That work is item 5
-in `missing.md`; it should start with case 1, whose mode choice is the one thing
+in `sanghaar.md`; it should start with case 1, whose mode choice is the one thing
 currently known to vary run to run.
 
 ---

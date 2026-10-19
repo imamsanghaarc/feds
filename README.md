@@ -58,7 +58,7 @@ languages, WebAssembly, and three workflow skills (`summarize-component`,
 | Re-embedding | `reembed.py` | Rebuilds vectors on a model change, dedupes tasks |
 | Audit replay | `replay.py` | Reconstructs a conversation from the trail |
 | Design record | `plan.md` | The significant decisions and why |
-| Backlog | `missing.md` | Done, deferred, or blocked |
+| Backlog | `sanghaar.md` | Done, deferred, or blocked |
 
 ### Runtime rules
 
