@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }}</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; padding-bottom: 20px; border-bottom: 1px solid #ddd; }
+        h1 { color: #333; font-size: 28px; }
+        h2 { color: #333; font-size: 20px; margin: 24px 0 12px; }
+        .back-link { color: #1976d2; text-decoration: none; font-size: 14px; }
+        .back-link:hover { text-decoration: underline; }
+        .run-header { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .run-header h1 { margin: 0 0 12px; }
+        .meta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-top: 16px; }
+        .meta-item { padding: 12px; background: #f8f9fa; border-radius: 6px; }
+        .meta-item label { display: block; font-size: 12px; color: #666; margin-bottom: 4px; text-transform: uppercase; }
+        .meta-item value { font-family: monospace; font-size: 14px; color: #333; word-break: break-all; }
+        .tool-badge { display: inline-block; padding: 4px 10px; border-radius: 4px; font-size: 13px; font-weight: 500; margin-left: 8px; }
+        .tool-publish { background: #e3f2fd; color: #1976d2; }
+        .tool-promote { background: #f3e5f5; color: #7b1fa2; }
+        .status-badge { padding: 4px 12px; border-radius: 20px; font-size: 13px; font-weight: 500; }
+        .status-awaiting { background: #fff3e0; color: #f57c00; }
+        .trail { background: white; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); overflow: hidden; }
+        .trail-entry { padding: 16px; border-bottom: 1px solid #eee; }
+        .trail-entry:last-child { border-bottom: none; }
+        .trail-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+        .trail-actor { font-weight: 600; color: #333; }
+        .trail-action { color: #1976d2; font-weight: 500; }
+        .trail-time { color: #999; font-size: 12px; }
+        .trail-target { color: #666; font-size: 13px; margin: 4px 0; }
+        .trail-payload { font-size: 12px; color: #666; background: #f8f9fa; padding: 8px; border-radius: 4px; overflow-x: auto; font-family: monospace; white-space: pre-wrap; max-height: 200px; }
+        .decision-form { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-top: 20px; }
+        .decision-form h2 { margin-bottom: 16px; }
+        .form-group { margin-bottom: 16px; }
+        .form-group label { display: block; margin-bottom: 6px; font-weight: 500; color: #333; }
+        .form-group input, .form-group select { width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; }
+        .form-group input:focus, .form-group select:focus { outline: none; border-color: #1976d2; box-shadow: 0 0 0 3px rgba(25,118,210,0.2); }
+        .btn { display: inline-block; padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500; margin-right: 10px; }
+        .btn-primary { background: #1976d2; color: white; }
+        .btn-primary:hover { background: #1565c0; }
+        .btn-danger { background: #d32f2f; color: white; }
+        .btn-danger:hover { background: #c62828; }
+        .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+        .task-context { background: #fff3e0; padding: 16px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #f57c00; }
+        .task-context h3 { margin-bottom: 8px; color: #e65100; }
+        .task-context pre { background: #f5f5f5; padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 13px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <a href="/" class="back-link">← Back to Dashboard</a>
+            <h1>{{ title }}</h1>
+        </header>
+
+        <div class="run-header">
+            <h1>Run <code>{{ run.run_id }}</code>
+                <span class="tool-badge tool-{{ run.tool_name.split('_')[0] }}">{{ run.tool_name }}</span>
+                <span class="status-badge status-{{ run.status }}">{{ run.status }}</span>
+            </h1>
+            <div class="meta-grid">
+                <div class="meta-item"><label>Run ID</label><value>{{ run.run_id }}</value></div>
+                <div class="meta-item"><label>Conversation ID</label><value>{{ run.conversation_id }}</value></div>
+                <div class="meta-item"><label>Tool</label><value>{{ run.tool_name }}</value></div>
+                <div class="meta-item"><label>Status</label><value>{{ run.status }}</value></div>
+                <div class="meta-item"><label>Created</label><value>{{ run.created_at.strftime('%Y-%m-%d %H:%M:%S UTC') if run.created_at else '—' }}</value></div>
+                <div class="meta-item"><label>Updated</label><value>{{ run.updated_at.strftime('%Y-%m-%d %H:%M:%S UTC') if run.updated_at else '—' }}</value></div>
+            </div>
+        </div>
+
+        {% if task_context %}
+        <div class="task-context">
+            <h3>Task Context</h3>
+            <pre>{{ task_context.metadata | tojson(indent=2) if task_context.metadata else 'No metadata' }}</pre>
+            {% if task_context.summary %}
+            <p><strong>Summary:</strong> {{ task_context.summary }}</p>
+            {% endif %}
+        </div>
+        {% endif %}
+
+        <h2>Conversation Trail</h2>
+        <div class="trail">
+            {% for entry in trail %}
+            <div class="trail-entry">
+                <div class="trail-header">
+                    <span class="trail-actor">{{ entry.actor }}</span>
+                    <span class="trail-action">{{ entry.action }}</span>
+                    <span class="trail-time">{{ entry.created_at.strftime('%H:%M:%S') if entry.created_at else '' }}</span>
+                </div>
+                {% if entry.target %}
+                <div class="trail-target">Target: {{ entry.target }}</div>
+                {% endif %}
+                {% if entry.payload %}
+                <div class="trail-payload">{{ entry.payload | tojson(indent=2) }}</div>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </div>
+
+        <div class="decision-form">
+            <h2>Decision</h2>
+            <form method="POST" action="/run/{{ run.run_id }}/decide">
+                <div class="form-group">
+                    <label>Decision</label>
+                    <select name="decision" required>
+                        <option value="">Select decision</option>
+                        <option value="approve">Approve</option>
+                        <option value="reject">Reject</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Operator Name (must be in FEDS_ALLOWED_OPERATORS)</label>
+                    <input type="text" name="operator" required placeholder="e.g., alice" autocomplete="off">
+                </div>
+                <button type="submit" name="decision" value="approve" class="btn btn-primary">Approve</button>
+                <button type="submit" name="decision" value="reject" class="btn btn-danger">Reject</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>

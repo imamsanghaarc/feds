@@ -62,6 +62,7 @@ def check_shape() -> None:
         ("openai", config.OPENAI_API_KEY),
         ("gemini", config.GEMINI_API_KEY),
         ("gemini-fallback", config.GEMINI_FALLBACK_API_KEY),
+        ("openrouter", config.OPENROUTER_API_KEY),
     ):
         if not key:
             print(f"[SKIP] {name} has no key configured (provider disabled)")
@@ -74,6 +75,8 @@ def check_shape() -> None:
 
     if config.OPENAI_API_KEY:
         assert config.OPENAI_API_KEY.startswith("sk-"), "openai key has unexpected prefix"
+    if config.OPENROUTER_API_KEY:
+        assert config.OPENROUTER_API_KEY.startswith("sk-or-"), "openrouter key has unexpected prefix"
     # Two identical Gemini keys would look like redundancy while sharing one
     # quota pool - the exact failure this fallback exists to prevent.
     if config.GEMINI_API_KEY and config.GEMINI_FALLBACK_API_KEY:
@@ -94,6 +97,7 @@ def check_shape() -> None:
             config.GEMINI_FALLBACK_API_KEY,
             config.ENABLED_FLAGS.get("gemini-fallback", False),
         ),
+        ("openrouter", config.OPENROUTER_API_KEY, config.OPENROUTER_ENABLED),
     ):
         if not key:
             assert not enabled, f"{name} is enabled without a credential"
@@ -183,6 +187,19 @@ def _gemini_key_valid(key: str) -> tuple[bool, str]:
         return False, f"{type(exc).__name__}"
 
 
+def _openrouter_key_valid(key: str) -> tuple[bool, str]:
+    """Validate an OpenRouter API key by making a lightweight models call."""
+    request = urllib.request.Request("https://openrouter.ai/api/v1/models")
+    request.add_header("Authorization", f"Bearer {key}")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.status == 200, f"HTTP {response.status}"
+    except urllib.error.HTTPError as exc:
+        return False, f"HTTP {exc.code}"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{type(exc).__name__}"
+
+
 def check_live_credentials(strict: bool) -> int:
     """Verify each configured key authenticates.
 
@@ -195,6 +212,7 @@ def check_live_credentials(strict: bool) -> int:
         ("openai", lambda: _openai_key_valid(config.OPENAI_API_KEY)),
         ("gemini", lambda: _gemini_key_valid(config.GEMINI_API_KEY)),
         ("gemini-fallback", lambda: _gemini_key_valid(config.GEMINI_FALLBACK_API_KEY)),
+        ("openrouter", lambda: _openrouter_key_valid(config.OPENROUTER_API_KEY)),
     ):
         valid, detail = probe()
         if valid:

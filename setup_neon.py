@@ -21,6 +21,7 @@ from psycopg import sql
 from config import NEON_DATABASE_URL, require_config
 
 APP_ROLE_DEFAULT = "feds_app"
+APPROVER_ROLE_DEFAULT = "feds_approver"
 
 # Privileges the runtime genuinely needs: read/write the working tables and
 # advance the identity sequences. Deliberately no CREATE (no new objects), no
@@ -34,6 +35,19 @@ _APP_ROLE_GRANTS = (
     "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {role}",
     "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
     "GRANT USAGE, SELECT ON SEQUENCES TO {role}",
+    # Explicit grant for verifications table (created after default privileges)
+    "GRANT SELECT, INSERT ON verifications TO {role}",
+    # Explicit grant for workspace_budgets table
+    "GRANT SELECT, UPDATE ON workspace_budgets TO {role}",
+)
+
+# Approver role: can write to approvals table only, plus execute promotion functions
+_APPROVER_ROLE_GRANTS = (
+    "GRANT USAGE ON SCHEMA public TO {role}",
+    "REVOKE CREATE ON SCHEMA public FROM {role}",
+    "GRANT SELECT, INSERT ON approvals TO {role}",
+    "GRANT EXECUTE ON FUNCTION promote_task() TO {role}",
+    "GRANT EXECUTE ON FUNCTION promote_memory() TO {role}",
 )
 
 SCHEMA_SQL = """
@@ -95,7 +109,8 @@ CREATE TABLE IF NOT EXISTS audit_log (
         'refund_issued',
         'refund_blocked',
         'guardrail_tripped',
-        'corpus_seeded'
+        'corpus_seeded',
+        'session_stopped'
     )),
     target          TEXT,
     payload         JSONB NOT NULL,
@@ -120,6 +135,23 @@ CREATE TABLE IF NOT EXISTS capability_invocations (
 );
 CREATE INDEX IF NOT EXISTS idx_cap_conv
     ON capability_invocations(conversation_id, created_at);
+
+-- Approvals table: only the approver role can write; the app role can read.
+-- An approval is required before publish_task or promote_memory can succeed.
+CREATE TABLE IF NOT EXISTS approvals (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    target_type     TEXT NOT NULL CHECK (target_type IN ('task', 'memory')),
+    target_id       UUID NOT NULL,
+    operator        TEXT NOT NULL,
+    decision        TEXT NOT NULL CHECK (decision IN ('approve', 'reject')),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (target_type, target_id)
+);
+CREATE INDEX IF NOT EXISTS idx_approvals_target
+    ON approvals(target_type, target_id);
+
+-- The app role (feds_app) needs SELECT on approvals to check in triggers
+GRANT SELECT ON approvals TO feds_app;
 
 -- Section 6a: private per-user memory and the shared global layer.
 -- Private rows are owned by one user id (the isolation boundary).
@@ -184,6 +216,125 @@ CREATE TRIGGER trg_memories_global_append_only
     BEFORE UPDATE OR DELETE ON memories
     FOR EACH ROW EXECUTE FUNCTION memories_global_is_append_only();
 
+-- Promotion function for tasks (publish_task): called by trigger when a document
+-- with source='frontend-task' is inserted/updated to status='published'.
+-- Requires a matching approval row in approvals table.
+CREATE OR REPLACE FUNCTION promote_task()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_status text;
+    v_approval record;
+BEGIN
+    -- Only fire for frontend-task documents being published
+    IF NEW.source <> 'frontend-task' OR NEW.metadata->>'status' <> 'published' THEN
+        RETURN NEW;
+    END IF;
+    
+    -- Check for approval
+    SELECT * INTO v_approval
+    FROM approvals
+    WHERE target_type = 'task' AND target_id = NEW.id AND decision = 'approve';
+    
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'publish requires human approval: no approval found for task %', NEW.id;
+    END IF;
+    
+    -- Approval stays for audit trail
+    RETURN NEW;
+END;
+$$;
+
+-- Promotion function for memories (promote_memory): called by trigger when a
+-- memory row is inserted into global scope. Requires approval + valid provenance.
+CREATE OR REPLACE FUNCTION promote_memory()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_origin record;
+    v_global_id uuid;
+BEGIN
+    -- Only fire for global scope inserts
+    IF NEW.scope <> 'global' THEN
+        RETURN NEW;
+    END IF;
+    
+    -- Verify the private memory exists and is promotable
+    SELECT id, body, metadata, owner INTO v_origin
+    FROM memories
+    WHERE id = NEW.id
+      AND scope = 'private'
+      AND status = 'active';
+    
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'active private memory not found for promotion: %', NEW.id;
+    END IF;
+    
+    IF (v_origin.metadata->>'project_specific')::boolean IS TRUE THEN
+        RAISE EXCEPTION 'memory is marked project_specific; generalizable lessons only';
+    END IF;
+    
+    IF (v_origin.metadata->>'generalizable')::boolean IS NOT TRUE THEN
+        RAISE EXCEPTION 'memory is not flagged generalizable';
+    END IF;
+    
+    -- Check for approval
+    IF NOT EXISTS (
+        SELECT 1 FROM approvals
+        WHERE target_type = 'memory' AND target_id = NEW.id AND decision = 'approve'
+    ) THEN
+        RAISE EXCEPTION 'promote_memory requires human approval: no approval found for memory %', NEW.id;
+    END IF;
+    
+    -- Insert the global row (sanitized body only)
+    INSERT INTO memories (scope, owner, body, metadata, verification, promoted_by, promoted_at)
+    VALUES ('global', '-', NEW.body, 
+            jsonb_build_object(
+                'promoted_from', NEW.id,
+                'promoted_by', current_user,
+                'verification', NEW.verification,
+                'sanitized_by_gate', true,
+                'source_chars', length(v_origin.body),
+                'shared_chars', length(NEW.body)
+            ),
+            NEW.verification,
+            current_user,
+            NOW())
+    RETURNING id INTO v_global_id;
+    
+    -- Update the origin memory status
+    UPDATE memories
+    SET status = 'promoted', verification = NEW.verification, promoted_by = current_user, promoted_at = NOW()
+    WHERE id = NEW.id;
+    
+    -- Return NULL to prevent the original INSERT (we did our own INSERT)
+    RETURN NULL;
+END;
+$$;
+
+-- Trigger on documents: enforce approval when publishing a frontend task
+DROP TRIGGER IF EXISTS trg_documents_publish_approval ON documents;
+CREATE TRIGGER trg_documents_publish_approval
+    BEFORE UPDATE ON documents
+    FOR EACH ROW
+    WHEN (OLD.source = 'frontend-task' AND NEW.metadata->>'status' = 'published'
+          AND (OLD.metadata->>'status' IS DISTINCT FROM NEW.metadata->>'status'))
+EXECUTE FUNCTION promote_task();
+
+-- Trigger on memories: enforce approval when inserting into global scope
+DROP TRIGGER IF EXISTS trg_memories_promote_approval ON memories;
+CREATE TRIGGER trg_memories_promote_approval
+    BEFORE INSERT ON memories
+    FOR EACH ROW
+    WHEN (NEW.scope = 'global')
+EXECUTE FUNCTION promote_memory();
+
 -- Decision 9: a gated tool pauses its run and parks the serialized agent state
 -- here until an operator decides with --decide. This table is created (not
 -- merely altered below) so a fresh deployment can park and resume approvals at
@@ -197,14 +348,46 @@ CREATE TABLE IF NOT EXISTS run_states (
     status          TEXT NOT NULL
                     CHECK (status IN ('awaiting', 'approved', 'rejected', 'resumed', 'error')),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    operator        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_run_states_conversation
     ON run_states(conversation_id, created_at DESC);
 
--- Added when operator attribution landed: who approved or rejected each run.
--- `IF NOT EXISTS` keeps the statement safe on a database that already has it.
-ALTER TABLE run_states ADD COLUMN IF NOT EXISTS operator TEXT;
+-- Verification results for zero-quota frontend quality checks (v1-02).
+-- Tied to task + conversation + revision. Stores CWV metrics, axe violations,
+-- screenshot artifact path, and pass/fail status. Used to gate publish_task.
+CREATE TABLE IF NOT EXISTS verifications (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id         UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversations(session_id) ON DELETE CASCADE,
+    revision        INT NOT NULL DEFAULT 1,
+    verifier_version TEXT NOT NULL,
+    timestamp       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    status          TEXT NOT NULL CHECK (status IN ('pass', 'fail', 'error')),
+    metrics_json    JSONB NOT NULL,
+    violations_json JSONB NOT NULL,
+    artifact_path   TEXT,
+    error           TEXT,
+    UNIQUE (task_id, conversation_id, revision)
+);
+CREATE INDEX IF NOT EXISTS idx_verifications_task_rev
+    ON verifications(task_id, revision DESC);
+CREATE INDEX IF NOT EXISTS idx_verifications_conv
+    ON verifications(conversation_id, timestamp DESC);
+
+-- Budget management (v1-12): per-workspace monthly budgets with hard caps.
+CREATE TABLE IF NOT EXISTS workspace_budgets (
+    workspace_id          TEXT PRIMARY KEY,
+    monthly_budget_cents  INT NOT NULL CHECK (monthly_budget_cents >= 0),
+    warning_threshold_pct DECIMAL(4,3) NOT NULL DEFAULT 0.800 CHECK (warning_threshold_pct > 0 AND warning_threshold_pct <= 1),
+    hard_cap_enabled      BOOLEAN NOT NULL DEFAULT TRUE,
+    alert_recipients      JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_workspace_budgets_updated
+    ON workspace_budgets(updated_at DESC);
 
 -- The Agents SDK persistence layer (`SQLAlchemySession`) can create these two
 -- tables itself, but it defaults to doing so lazily on first use. Creating them
@@ -300,6 +483,64 @@ def _verify_app_role(conn: psycopg.Connection, role: str) -> None:
     )
 
 
+def _provision_approver_role(conn: psycopg.Connection) -> None:
+    """Create or update the approver role with write access to approvals table."""
+    role = os.getenv("FEDS_APPROVER_DB_ROLE", APPROVER_ROLE_DEFAULT).strip() or APPROVER_ROLE_DEFAULT
+    password = os.getenv("FEDS_APPROVER_DB_PASSWORD", "").strip()
+    if not password:
+        print(
+            "[SKIP] FEDS_APPROVER_DB_PASSWORD is not set; approval enforcement will "
+            "not work (no role to write approvals). Set it to enable DB-enforced approval."
+        )
+        return
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,))
+        if cur.fetchone() is None:
+            cur.execute(
+                sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
+                    sql.Identifier(role), sql.Literal(password)
+                )
+            )
+            print(f"[OK] created approver role {role!r}")
+        else:
+            cur.execute(
+                sql.SQL("ALTER ROLE {} WITH LOGIN PASSWORD {}").format(
+                    sql.Identifier(role), sql.Literal(password)
+                )
+            )
+            print(f"[OK] refreshed approver role {role!r}")
+
+        # Verify it's least-privilege (no SUPERUSER/CREATEDB/CREATEROLE/BYPASSRLS)
+        cur.execute(
+            "SELECT rolsuper, rolcreatedb, rolcreaterole, rolbypassrls "
+            "FROM pg_roles WHERE rolname = %s",
+            (role,),
+        )
+        row = cur.fetchone()
+        if row:
+            elevated = [
+                name
+                for name, flag in zip(
+                    ("SUPERUSER", "CREATEDB", "CREATEROLE", "BYPASSRLS"), row, strict=True
+                )
+                if flag
+            ]
+            if elevated:
+                sys.exit(
+                    f"[ERROR] approver role {role!r} holds elevated attributes {elevated}; "
+                    "revoke them in Neon."
+                )
+
+        for statement in _APPROVER_ROLE_GRANTS:
+            cur.execute(sql.SQL(statement).format(role=sql.Identifier(role)))
+    conn.commit()
+    print(
+        f"[OK] approver role {role!r} is least-privilege "
+        "(no SUPERUSER/CREATEDB/CREATEROLE/BYPASSRLS)"
+    )
+
+
 def main() -> None:
     if not NEON_DATABASE_URL:
         for problem in require_config() or ["NEON_DATABASE_URL is not set."]:
@@ -312,6 +553,7 @@ def main() -> None:
             cur.execute(SCHEMA_SQL)
         conn.commit()
         _provision_app_role(conn)
+        _provision_approver_role(conn)
 
     with psycopg.connect(NEON_DATABASE_URL) as conn:
         with conn.cursor() as cur:
@@ -326,6 +568,11 @@ def main() -> None:
                 (os.getenv("FEDS_APP_DB_ROLE", APP_ROLE_DEFAULT).strip() or APP_ROLE_DEFAULT,),
             )
             print("runtime role:", [row[0] for row in cur.fetchall()])
+            cur.execute(
+                "SELECT rolname FROM pg_roles WHERE rolname = %s",
+                (os.getenv("FEDS_APPROVER_DB_ROLE", APPROVER_ROLE_DEFAULT).strip() or APPROVER_ROLE_DEFAULT,),
+            )
+            print("approver role:", [row[0] for row in cur.fetchall()])
 
 
 if __name__ == "__main__":

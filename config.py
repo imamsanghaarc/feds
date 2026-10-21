@@ -73,9 +73,9 @@ AGENT_NAME = f"{OFFICIAL_NAME} — {OFFICIAL_NAME_LONG}"
 # on. Each currently-blocked provider ships disabled so a bad credential cannot
 # silently degrade every turn.
 
-# OpenAI: chat + embeddings. Currently disabled, credential returns HTTP 401.
+# OpenAI: chat + embeddings. Valid key provided.
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-5-mini")
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 OPENAI_BASE_URL = ""  # empty means the official OpenAI endpoint
 OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
 OPENAI_ENABLED = bool(OPENAI_API_KEY) and os.getenv("OPENAI_ENABLED", "1") != "0"
@@ -102,6 +102,13 @@ GEMINI_FALLBACK_API_KEY = os.getenv("GEMINI_FALLBACK_API_KEY", "")
 GEMINI_FALLBACK_ENABLED = bool(GEMINI_FALLBACK_API_KEY) and os.getenv(
     "GEMINI_FALLBACK_ENABLED", "1"
 ) != "0"
+
+# OpenRouter: chat only (no embeddings endpoint). OpenAI-compatible API, routes to
+# many models (Claude, GPT, Gemini, Llama, etc.). Use a model slug from their catalog.
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_CHAT_MODEL = os.getenv("OPENROUTER_CHAT_MODEL", "anthropic/claude-haiku-5.5")
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_ENABLED = bool(OPENROUTER_API_KEY) and os.getenv("OPENROUTER_ENABLED", "1") != "0"
 
 # --- Embeddings --------------------------------------------------------------
 
@@ -201,7 +208,8 @@ def _env_pricing(provider: str, default: str) -> tuple[float, float]:
 MODEL_PRICING_USD_PER_M_TOKENS = {
     "gemini-3.5-flash": _env_pricing("gemini", "0.30,2.50"),
     "gemini-3.5-flash-lite": _env_pricing("gemini-lite", "0.10,0.40"),
-    "openai-gpt-5-mini": _env_pricing("openai", "0.25,2.00"),
+    "anthropic/claude-haiku-5.5": _env_pricing("openrouter", "0.25,1.25"),
+    "gpt-4o-mini": _env_pricing("openai", "0.15,0.60"),
 }
 
 
@@ -239,6 +247,12 @@ _CHAT_PROVIDERS: dict[str, dict[str, object]] = {
         "base_url": GEMINI_BASE_URL,
         "api_key": GEMINI_FALLBACK_API_KEY,
     },
+    "openrouter": {
+        "enabled": OPENROUTER_ENABLED,
+        "model": OPENROUTER_CHAT_MODEL,
+        "base_url": OPENROUTER_BASE_URL,
+        "api_key": OPENROUTER_API_KEY,
+    },
     "openai": {
         "enabled": OPENAI_ENABLED,
         "model": OPENAI_CHAT_MODEL,
@@ -248,8 +262,8 @@ _CHAT_PROVIDERS: dict[str, dict[str, object]] = {
     }
 
 # Preference order for chat. Gemini leads; the fallback key covers its quota
-# gaps; anything else is ordered after them.
-CHAT_PREFERENCE = ("gemini", "gemini-fallback", "openai")
+# gaps; OpenRouter adds multi-model routing; OpenAI as final fallback.
+CHAT_PREFERENCE = ("gemini", "gemini-fallback", "openrouter", "openai")
 
 CHAT_MODELS = {
     name: {"model": cfg["model"], "base_url": cfg["base_url"], "api_key": cfg["api_key"]}
@@ -285,7 +299,7 @@ def require_config() -> list[str]:
     if not chat_order():
         problems.append(
             "No chat provider is enabled. Set GEMINI_API_KEY (a second Gemini key "
-            "can be added as GEMINI_FALLBACK_API_KEY) in .env or the environment."
+            "can be added as GEMINI_FALLBACK_API_KEY) or GROQ_API_KEY in .env or the environment."
         )
     if not problems and not embedding_order():
         problems.append(

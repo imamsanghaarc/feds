@@ -1,0 +1,32 @@
+{
+  "version": "1.0.0",
+  "project": "feds-ksor",
+  "rung": 1,
+  "knowledgeDir": "knowledge",
+  "outputDir": "dist",
+  "llmsTxt": "llms.txt",
+  "frontmatter": {
+    "required": ["title", "description", "owner", "audience", "status", "sources", "freshness", "lifecycle", "tags", "version"],
+    "enforce": {
+      "stableRequiresReview": true,
+      "maxDraftAgeDays": 30
+    }
+  },
+  "audience": {
+    "default": ["public"],
+    "values": ["public", "internal", "restricted"]
+  },
+  "status": {
+    "values": ["draft", "stable", "deprecated"],
+    "default": "draft"
+  },
+  "lifecycle": {
+    "values": ["active", "archived"],
+    "default": "active"
+  },
+  "build": {
+    "generateLlmsTxt": true,
+    "generateSite": false,
+    "failOnDraftInStable": true
+  }
+}

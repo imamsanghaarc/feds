@@ -1,0 +1,23 @@
+{
+  "name": "feds-ksor",
+  "version": "1.0.0",
+  "description": "FEDS Knowledge System of Record (KSoR Rung 1)",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "ksor build",
+    "dev": "ksor dev",
+    "check": "ksor build --strict",
+    "migrate": "node scripts/migrate-skills.js"
+  },
+  "dependencies": {
+    "ksor": "^1.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

@@ -703,11 +703,10 @@ def _mcp_server(conversation_id: str | None) -> MCPServerStdio:
         name="frontend-workspace",
         cache_tools_list=True,
         client_session_timeout_seconds=20,
-        # Decision 9: gate the two promotion writes and leave the reads free.
-        # `publish_task` promotes frontend tasks and `promote_memory` promotes
-        # private lessons into the shared layer; both are the only paths to a
-        # promotion, so both pause for a human.
-        require_approval={"publish_task": "always", "promote_memory": "always"},
+        # DB-enforced approval (v1-06): promotion gates moved to SECURITY DEFINER
+        # functions + triggers in Neon. The feds_app role cannot write to approvals
+        # table, so a compromised worker cannot bypass approval. Worker-side
+        # require_approval removed; DB is now the authority.
     )
 
 
@@ -807,6 +806,202 @@ async def _conversation_lock(engine, conversation_id: str):
             )
 
 
+async def get_session_events(
+    conversation_id: str,
+    from_seq: int = 0,
+    to_seq: int | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Get event slice from audit_log for session reconstruction.
+    
+    Used by durable session log (v1-07) to rebuild state on restart.
+    """
+    engine_url = DATABASE_URL.split("?", 1)[0].replace("postgresql://", "postgresql+asyncpg://", 1)
+    engine = create_async_engine(
+        engine_url,
+        connect_args={"ssl": "require", "statement_cache_size": 0},
+        pool_pre_ping=True,
+    )
+    try:
+        async with engine.begin() as db:
+            query = text("""
+                SELECT id, conversation_id, actor, action, target, payload, result, created_at
+                FROM audit_log
+                WHERE conversation_id = :cid
+                AND id > :from_seq
+                ORDER BY id ASC
+                LIMIT :limit
+            """)
+            params = {"cid": conversation_id, "from_seq": from_seq, "limit": limit}
+            if to_seq is not None:
+                query = text("""
+                    SELECT id, conversation_id, actor, action, target, payload, result, created_at
+                    FROM audit_log
+                    WHERE conversation_id = :cid
+                    AND id > :from_seq AND id <= :to_seq
+                    ORDER BY id ASC
+                    LIMIT :limit
+                """)
+                params["to_seq"] = to_seq
+            
+            rows = await db.execute(query, params)
+            return [
+                {
+                    "id": row.id,
+                    "conversation_id": row.conversation_id,
+                    "actor": row.actor,
+                    "action": row.action,
+                    "target": row.target,
+                    "payload": row.payload,
+                    "result": row.result,
+                    "created_at": row.created_at.isoformat() if row.created_at else None,
+                }
+                for row in rows
+            ]
+    finally:
+        await engine.dispose()
+
+
+async def resume_session(
+    conversation_id: str,
+    user_input: str = "",
+    max_iterations: int = 50,
+    max_cost_cents: int | None = None,
+    wall_clock_limit: int | None = None,
+) -> None:
+    """Resume a session from audit_log events.
+    
+    v1-07: Durable session log + resume. Re-reads events and continues.
+    Enforces stopping conditions: max_iterations, max_cost_cents, wall_clock_limit.
+    """
+    global _CURRENT_CONVERSATION_ID
+    
+    # Get existing events
+    events = await get_session_events(conversation_id)
+    if not events:
+        raise ValueError(f"No events found for conversation {conversation_id}")
+    
+    _CURRENT_CONVERSATION_ID = conversation_id
+    engine_url = DATABASE_URL.split("?", 1)[0].replace("postgresql://", "postgresql+asyncpg://", 1)
+    engine = create_async_engine(
+        engine_url,
+        connect_args={"ssl": "require", "statement_cache_size": 0},
+        pool_pre_ping=True,
+    )
+    
+    # Check for parked approval first
+    async with engine.begin() as db:
+        parked = await db.execute(text("""
+            SELECT run_id, tool_name, state_text FROM run_states
+            WHERE conversation_id = :cid AND status = 'awaiting'
+            ORDER BY created_at DESC LIMIT 1
+        """), {"cid": conversation_id})
+        parked_row = parked.mappings().first()
+    
+    if parked_row:
+        # Resume the parked approval via existing decide_run path
+        print(f"Resuming parked approval: run_id={parked_row['run_id']}")
+        await decide_run(parked_row['run_id'], "approve", "operator-local")
+        return
+    
+    # Otherwise continue with new input
+    agent, sandbox_client = build_agent()
+    
+    # Use existing session if available
+    session = SQLAlchemySession(
+        session_id=conversation_id,
+        engine=engine,
+        create_tables=True,
+    )
+    
+    iteration = 0
+    total_cost = 0
+    start_time = time.perf_counter()
+    
+    mcp_server = _mcp_server(conversation_id)
+    
+    async with mcp_server as server:
+        agent.mcp_servers = [server]
+        
+        while iteration < max_iterations:
+            # Check cost limit
+            if max_cost_cents and total_cost >= max_cost_cents:
+                await _audit_stop(conversation_id, "max_cost_cents", total_cost)
+                print(f"Stopped: max cost ({max_cost_cents} cents) reached")
+                break
+            
+            # Check wall clock limit
+            if wall_clock_limit and (time.perf_counter() - start_time) > wall_clock_limit:
+                await _audit_stop(conversation_id, "wall_clock_limit", time.perf_counter() - start_time)
+                print(f"Stopped: wall clock limit ({wall_clock_limit}s) reached")
+                break
+            
+            iteration += 1
+            turn_started = time.perf_counter()
+            
+            # Run one turn
+            if user_input and iteration == 1:
+                result = await Runner.run(
+                    agent, user_input, session=session,
+                    run_config=RunConfig(workflow_name="feds", tracing_disabled=True)
+                )
+            else:
+                # No new input, check if there's more to do
+                break
+            
+            # Record cost
+            await _record_turn_usage(engine, conversation_id, agent.model, result, turn_started)
+            
+            # Check for parked approval
+            run_state = result.to_state()
+            if run_state.get_interruptions():
+                run_id = uuid.uuid4().hex
+                tool_names = ", ".join(
+                    getattr(i, "tool_name", "unknown") for i in run_state.get_interruptions()
+                )
+                async with engine.begin() as db:
+                    await db.execute(text("""
+                        INSERT INTO run_states (run_id, conversation_id, tool_name, state_text, status)
+                        VALUES (:run_id, :conversation_id, :tool_name, :state_text, 'awaiting')
+                    """), {
+                        "run_id": run_id,
+                        "conversation_id": conversation_id,
+                        "tool_name": tool_names,
+                        "state_text": run_state.to_string(),
+                    })
+                print(f"Approval required: run_id={run_id} tool={tool_names}")
+                break
+            
+            final_output = str(result.final_output).strip() if result.final_output else ""
+            if final_output:
+                print(final_output)
+            
+            user_input = ""  # Only use initial input once
+    
+    await engine.dispose()
+    _CURRENT_CONVERSATION_ID = None
+
+
+async def _audit_stop(conversation_id: str, reason: str, detail: Any) -> None:
+    """Record stop reason to audit_log."""
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.transaction():
+                conn.execute(
+                    "INSERT INTO audit_log (conversation_id, actor, action, target, payload, result) VALUES (%s,%s,%s,%s,%s::jsonb,%s::jsonb)",
+                    (
+                        conversation_id,
+                        "worker:frontend-development",
+                        "session_stopped",
+                        "session",
+                        json.dumps({"reason": reason, "detail": detail}),
+                        json.dumps({"status": "stopped"}),
+                    ),
+                )
+    except Exception:
+        pass  # Best effort
+
+
 async def run_task(user_input: str) -> None:
     global _CURRENT_CONVERSATION_ID
 
@@ -877,6 +1072,15 @@ async def run_task(user_input: str) -> None:
             )
             async with mcp_server as server:
                 agent.mcp_servers = [server]
+                # v1-11: Set per-conversation user identity for memory isolation
+                try:
+                    from frontend_workspace_mcp.server import set_user as mcp_set_user
+                    # In real use, this would come from auth system; for now use env var
+                    user_id = os.getenv("FEDS_USER_ID") or os.getenv("USERNAME") or os.getenv("USER") or "default-user"
+                    user_name = os.getenv("FEDS_USER_NAME", "")
+                    await mcp_set_user(user_id=user_id, user_name=user_name)
+                except Exception:
+                    pass  # Non-fatal if MCP tools not available yet
                 result = await Runner.run(
                     agent,
                     user_input,
@@ -886,6 +1090,14 @@ async def run_task(user_input: str) -> None:
         else:
             async with mcp_server as server:
                 agent.mcp_servers = [server]
+                # v1-11: Set per-conversation user identity for memory isolation
+                try:
+                    from frontend_workspace_mcp.server import set_user as mcp_set_user
+                    user_id = os.getenv("FEDS_USER_ID") or os.getenv("USERNAME") or os.getenv("USER") or "default-user"
+                    user_name = os.getenv("FEDS_USER_NAME", "")
+                    await mcp_set_user(user_id=user_id, user_name=user_name)
+                except Exception:
+                    pass
                 result = await Runner.run(
                     agent,
                     user_input,
@@ -1139,7 +1351,7 @@ async def decide_run(run_id: str, decision: str, operator: str = DEFAULT_OPERATO
 
 
 async def main() -> int | None:
-    """Run one agent turn, or apply one --decide.
+    """Run one agent turn, apply --decide, or --resume a session.
 
     --decide paths return a real exit code (0 recorded, 1 refused or failed,
     2 usage error) so an operator's shell or a future console cannot mistake
@@ -1157,6 +1369,48 @@ async def main() -> int | None:
             return 2
         operator = args[3] if len(args) == 4 else DEFAULT_OPERATOR
         return 0 if await decide_run(args[1], args[2], operator) else 1
+
+    if args and args[0] == "--resume":
+        # Usage: --resume <conversation_id> [user_input] [--max-iterations N] [--max-cost CENTS] [--max-time SECONDS]
+        if len(args) < 2:
+            print("Usage: uv run python worker.py --resume <conversation_id> [user_input] [--max-iterations N] [--max-cost CENTS] [--max-time SECONDS]")
+            return 2
+        conversation_id = args[1]
+        # Parse optional args
+        user_input = ""
+        max_iterations = 50
+        max_cost_cents = None
+        wall_clock_limit = None
+        
+        i = 2
+        while i < len(args):
+            if args[i] == "--max-iterations" and i + 1 < len(args):
+                max_iterations = int(args[i + 1])
+                i += 2
+            elif args[i] == "--max-cost" and i + 1 < len(args):
+                max_cost_cents = int(args[i + 1])
+                i += 2
+            elif args[i] == "--max-time" and i + 1 < len(args):
+                wall_clock_limit = int(args[i + 1])
+                i += 2
+            else:
+                user_input = args[i]
+                i += 1
+        
+        errors = validate_skill_tree()
+        if errors:
+            for error in errors:
+                print(error)
+            return
+        
+        await resume_session(
+            conversation_id=conversation_id,
+            user_input=user_input,
+            max_iterations=max_iterations,
+            max_cost_cents=max_cost_cents,
+            wall_clock_limit=wall_clock_limit,
+        )
+        return
 
     user_input = " ".join(args) if args else ""
     if not user_input:

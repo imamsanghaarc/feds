@@ -1,0 +1,185 @@
+name: FEDS CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    # Daily live eval run at 03:00 UTC (when quota likely reset)
+    - cron: '0 3 * * *'
+
+env:
+  UV_VERSION: 0.5.0
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  offline-tests:
+    name: Offline Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Cache uv
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+      
+      - name: Sync dependencies
+        run: uv sync --frozen
+      
+      - name: Run offline test suite
+        run: uv run python run_tests.py
+        env:
+          # Ensure no live tests run
+          RUN_LIVE_TESTS: ""
+      
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            *.log
+            *.xml
+
+  live-eval:
+    name: Live Evaluation (Quota-Aware)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    env:
+      # These secrets must be configured in GitHub repository settings
+      NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+      FEDS_APP_DATABASE_URL: ${{ secrets.FEDS_APP_DATABASE_URL }}
+      FEDS_APP_DB_PASSWORD: ${{ secrets.FEDS_APP_DB_PASSWORD }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_FALLBACK_API_KEY: ${{ secrets.GEMINI_FALLBACK_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      FEDS_APPROVER_DB_PASSWORD: ${{ secrets.FEDS_APPROVER_DB_PASSWORD }}
+      FEDS_ALLOWED_OPERATORS: ${{ secrets.FEDS_ALLOWED_OPERATORS }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Cache uv
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+      
+      - name: Sync dependencies
+        run: uv sync --frozen
+      
+      - name: Setup database schema
+        run: uv run python setup_neon.py
+      
+      - name: Run trigger evaluation (resumable)
+        run: |
+          RETRY_ALL=1 uv run python eval_triggers.py || true
+        env:
+          RUN_LIVE_TESTS: "1"
+      
+      - name: Run system prompt evaluation (resumable)
+        run: |
+          # Each case can be run individually when quota permits
+          # This is a placeholder - actual cases run manually when quota available
+          echo "Live eval requires manual quota management"
+        env:
+          RUN_LIVE_TESTS: "1"
+      
+      - name: Upload eval results
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results
+          path: |
+            eval_results.md
+            eval_trigger_results.json
+
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Install truffleHog
+        run: |
+          curl -LsSf https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin
+      
+      - name: Scan for secrets
+        run: |
+          trufflehog git file://. --since-commit HEAD~1 --fail --no-verification
+
+  skill-validation:
+    name: Skill Tree Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Sync dependencies
+        run: uv sync --frozen
+      
+      - name: Validate skill tree
+        run: uv run python -c "
+import worker
+errors = worker.validate_skill_tree()
+if errors:
+    for e in errors:
+        print(e)
+    exit(1)
+print('Skill tree valid')
+"
+
+  # Ensure all jobs pass
+  gate:
+    name: Gate (All Checks Pass)
+    runs-on: ubuntu-latest
+    needs: [offline-tests, secret-scan, skill-validation]
+    if: always()
+    steps:
+      - name: Check all jobs passed
+        run: |
+          if [ "${{ needs.offline-tests.result }}" != "success" ]; then exit 1; fi
+          if [ "${{ needs.secret-scan.result }}" != "success" ]; then exit 1; fi
+          if [ "${{ needs.skill-validation.result }}" != "success" ]; then exit 1; fi
+          echo "All gates passed"

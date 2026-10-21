@@ -46,6 +46,7 @@ from frontend_workspace_mcp.server import (
     _vector_literal,
 )
 from worker import _frontmatter
+from security_ingestion import stamp_provenance, TrustLevel, format_retrieved_chunk
 
 DEFAULT_SOURCE = "reference-doc"
 TEXT_SUFFIXES = {".md", ".markdown", ".txt"}
@@ -75,6 +76,8 @@ def parse_reference(text: str, path: Path, source: str) -> dict | None:
     The frontmatter block is split exactly the way `worker._frontmatter` reads
     it, so the title the ingester reports is the title the rest of the system
     would have seen.
+
+    v1-09: Stamps provenance with trust_level and injection detection flags.
     """
     fields = _frontmatter(text)
     body = text
@@ -86,16 +89,23 @@ def parse_reference(text: str, path: Path, source: str) -> dict | None:
         return None
 
     title = (fields.get("title") or "").strip() or _title_from_path(path)
+    
+    # v1-09: Stamp provenance on the body content
+    provenance = stamp_provenance(body, source)
+    
+    metadata = {
+        "ingested_from": path.as_posix(),
+        "source": source,
+        "bytes": len(body.encode("utf-8")),
+        "title_from": "frontmatter" if fields.get("title") else "filename",
+        "provenance": provenance.to_dict(),
+    }
+    
     return {
         "title": title,
         "body": body,
         "context": (fields.get("context") or "").strip(),
-        "metadata": {
-            "ingested_from": path.as_posix(),
-            "source": source,
-            "bytes": len(body.encode("utf-8")),
-            "title_from": "frontmatter" if fields.get("title") else "filename",
-        },
+        "metadata": metadata,
     }
 
 

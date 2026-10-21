@@ -1,7 +1,7 @@
 # FEDS
 
 **F**rontend **E**ngineering **D**igital **S**pecialist — an AI Employee that
-designs, implements, reviews, and troubleshoots production-grade web interfaces.
+delivers **audited frontend performance and accessibility fixes**, approved by a human.
 ---
 
 ## Quick start
@@ -26,7 +26,28 @@ uv run python worker.py "Who are you?"
 
 ---
 
-## What FEDS does
+## The Wedge (v1-15)
+
+FEDS does **not** compete on "general frontend coding" — Cursor, Claude Code, v0, Lovable, Bolt, and Devin already own that space.
+
+**FEDS's wedge:** **Frontend performance and accessibility fixes, audited and approved by a human.**
+
+| What FEDS claims | How it's proven |
+|---|---|
+| "This change improves LCP by 400ms" | Zero-quota verifier measures before/after LCP/INP/CLS (v1-02) |
+| "This change fixes 3 accessibility violations" | axe-core WCAG 2.2 A/AA scan with rule IDs (v1-02) |
+| "A human approved this" | DB-enforced approval gate; worker cannot bypass (v1-06) |
+| "No code was injected" | Sandbox execution with credentials stripped (v1-08) |
+| "This prompt was not hijacked" | Ingestion provenance + retrieval contract (v1-09) |
+
+**What FEDS explicitly does NOT claim:**
+- Better general frontend coding than Cursor/Claude/v0
+- Autonomous operation without human approval
+- Perfect code generation without verification
+
+---
+
+## What FEDS Does
 
 | Capability | Tool |
 | --- | --- |
@@ -169,6 +190,32 @@ comma-separated allowlist (`FEDS_ALLOWED_OPERATORS=alice,bob`) to grant real
 names — the anonymous default is then refused unless it is listed too. An
 unauthorized decision writes an `approval_refused` audit row and the CLI
 exits non-zero.
+
+---
+
+## Governance (v1)
+
+| Feature | Implementation | Status |
+|---|---|---|
+| **DB-enforced approval** | `feds_approver` role + SECURITY DEFINER triggers; `feds_app` cannot forge approvals | v1-06 ✅ |
+| **Durable session log** | `audit_log` event slices; `--resume` restarts from last event | v1-07 ✅ |
+| **Sandbox execution** | Isolated Python/Node/Shell; credentials stripped; retryable errors | v1-08 ✅ |
+| **Injection defense** | Provenance stamping, retrieval contract, red-team tests | v1-09 ✅ |
+| **Approval console** | Web UI for parked runs (Slack/email notify) | v1-10 ✅ |
+| **Team identity** | Per-request user injection; memory isolation | v1-11 ✅ |
+| **Budgets & alerts** | Monthly caps, warning thresholds, hard-cap guardrail | v1-12 ✅ |
+| **CI pipeline** | GitHub Actions: offline tests, secret scan, skill validation, scheduled live evals | v1-13 ✅ |
+| **Pause notifications** | Slack/email on approval park | v1-14 ✅ |
+
+### Evidence artifacts
+
+| Artifact | Produced by | Purpose |
+|---|---|---|
+| `verifications` rows | Zero-quota verifier (v1-02) | Before/after CWV + axe-core deltas |
+| `approvals` rows | `feds_approver` role | Human approval record |
+| `audit_log` | Every write + guardrail trip | Full reconstruction |
+| `capability_invocations` | Every turn + tool call | Cost + latency rollups |
+| `verification_artifacts/` | Verifier screenshots | Visual proof |
 
 ---
 

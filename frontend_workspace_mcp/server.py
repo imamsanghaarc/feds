@@ -749,7 +749,8 @@ async def publish_task(name: str, target: str = "staging") -> dict[str, Any]:
     """Move an approved frontend task into a publishable target state.
 
     This is the highest-trust write in this server: it only promotes tasks that
-    a human already reviewed and approved, and it refuses anything else.
+    a human already reviewed and approved. The database enforces approval via
+    a trigger that requires a matching row in the approvals table.
     """
     name = name.strip()
     target = target.strip().lower()
@@ -790,8 +791,10 @@ async def publish_task(name: str, target: str = "staging") -> dict[str, Any]:
                 published_at = datetime.now(timezone.utc).isoformat()
                 published = metadata.get("published") or {}
                 published[target] = published_at
+                # Store target in metadata so the trigger knows where it's being published
                 metadata["published"] = published
-                metadata["status"] = "published" if target == "production" else metadata["status"]
+                metadata["status"] = "published"
+                metadata["published_target"] = target
 
                 await conn.execute(
                     """
@@ -799,7 +802,7 @@ async def publish_task(name: str, target: str = "staging") -> dict[str, Any]:
                     SET metadata = metadata || $1::jsonb, updated_at = now()
                     WHERE id = $2
                     """,
-                    json.dumps({"published": published, "status": metadata["status"]}),
+                    json.dumps({"published": published, "status": "published", "published_target": target}),
                     row["id"],
                 )
                 await conn.execute(
@@ -845,13 +848,37 @@ def _identity_variants() -> list[str]:
     return [value.strip() for value in raw if len(value.strip()) >= 3]
 
 
+# Per-conversation user identity mapping (v1-11: Team Identity)
+# Allows per-request user injection without process-level env var.
+_user_identity_cache: dict[str, str] = {}  # conversation_id -> user_id
+
+
+def set_conversation_user(conversation_id: str, user_id: str) -> None:
+    """Set the user identity for a conversation (called by worker)."""
+    if conversation_id and user_id:
+        _user_identity_cache[conversation_id] = user_id.strip()
+
+
+def clear_conversation_user(conversation_id: str) -> None:
+    """Clear user identity for a conversation."""
+    _user_identity_cache.pop(conversation_id, None)
+
+
 def _requester() -> str:
     """The user this MCP process serves; the isolation boundary.
 
-    The worker injects `FRONTEND_USER_ID` alongside the conversation id. With
-    no identity the server fails closed by refusing to serve, instead of
+    Priority:
+    1. Per-conversation user identity (set by worker via set_conversation_user)
+    2. Process-level FRONTEND_USER_ID env var (fallback for backward compat)
+    
+    With no identity the server fails closed by refusing to serve, instead of
     silently merging every user into one private bucket.
     """
+    conv_id = _conversation_id()
+    if conv_id and conv_id in _user_identity_cache:
+        return _user_identity_cache[conv_id]
+    
+    # Fallback to process-level env var
     user_id = (os.getenv("FRONTEND_USER_ID") or "").strip()
     if not user_id:
         raise IdentityError(
@@ -1027,22 +1054,62 @@ async def delete_memory(memory_id: str) -> dict[str, Any]:
         return {"deleted": True, "memory_id": memory_id}
 
 
-# The two writes a promotion performs, kept as constants so the schema smoke can
-# execute the exact statements against the live database (inside a rollback).
-# The global insert must carry `promoted_by`; the provenance constraint rejects
-# a shared row that does not.
-_PROMOTE_ORIGIN_SQL = """
-UPDATE memories
-SET status = 'promoted', verification = $2, promoted_by = $3, promoted_at = now()
-WHERE id = $1
-"""
+@mcp.tool()
+async def set_user(user_id: str, user_name: str = "") -> dict[str, Any]:
+    """Set the user identity for the current conversation (v1-11: Team Identity).
 
-_PROMOTE_GLOBAL_SQL = """
-INSERT INTO memories
-    (scope, owner, body, metadata, verification, promoted_by, promoted_at)
-VALUES ('global', $1, $2, $3::jsonb, $4, $5, now())
-RETURNING id
-"""
+    Called by the worker at the start of each task to establish per-request
+    user identity for memory isolation. This allows multiple users to share
+    the same MCP server process while maintaining strict memory isolation.
+
+    Args:
+        user_id: The unique identifier for the user (required).
+        user_name: Optional display name for the user.
+    """
+    user_id = user_id.strip()
+    if not user_id:
+        raise ValueError("user_id is required")
+    if len(user_id) < 3:
+        raise ValueError("user_id must be at least 3 characters")
+    
+    conv_id = _conversation_id()
+    if not conv_id:
+        raise PermissionError("No conversation ID available; cannot set user identity")
+    
+    set_conversation_user(conv_id, user_id)
+    
+    # Also store user_name if provided
+    if user_name:
+        user_name = user_name.strip()
+        # Store in cache with a suffix
+        _user_identity_cache[f"{conv_id}:name"] = user_name
+    
+    await _audit(
+        "capability_invoked",
+        "frontend-workspace",
+        {"tool": "set_user", "user_id": user_id},
+        {"status": "ok", "conversation_id": conv_id},
+    )
+    
+    return {"ok": True, "user_id": user_id, "conversation_id": conv_id}
+
+
+@mcp.tool()
+async def get_current_user() -> dict[str, Any]:
+    """Get the current user identity for the conversation."""
+    conv_id = _conversation_id()
+    if not conv_id:
+        return {"user_id": None, "user_name": None}
+    
+    user_id = _user_identity_cache.get(conv_id)
+    user_name = _user_identity_cache.get(f"{conv_id}:name")
+    
+    if not user_id:
+        # Fallback to env var
+        user_id = (os.getenv("FRONTEND_USER_ID") or "").strip() or None
+        user_name = (os.getenv("FRONTEND_USER_NAME") or "").strip() or None
+    
+    return {"user_id": user_id, "user_name": user_name, "conversation_id": conv_id}
 
 
 async def _promote_memory_in(
@@ -1050,10 +1117,10 @@ async def _promote_memory_in(
 ) -> dict[str, Any]:
     """The promotion transaction body, on a caller-provided connection.
 
-    Split out of the tool so the schema smoke can run the exact writes inside a
-    transaction it rolls back -- proving the committed path end to end without
-    leaving a shared row behind.
+    Now calls the SECURITY DEFINER function promote_memory() which enforces
+    approval via the approvals table. The function returns the global_id.
     """
+    # Validate locally first (sanitization, gates) before calling DB function
     row = await conn.fetchrow(
         """
         SELECT id, scope, owner, body, metadata, status
@@ -1083,27 +1150,17 @@ async def _promote_memory_in(
         )
     _assert_sanitizable(sanitized_body)
 
-    provenance = {
-        "promoted_from": str(row["id"]),
-        "promoted_by": os.getenv("MEMORY_PROMOTED_BY") or _requester(),
-        "verification": verification,
-        "sanitized_by_gate": True,
-        "source_chars": len(row["body"]),
-        "shared_chars": len(sanitized_body),
-    }
-    await conn.execute(
-        _PROMOTE_ORIGIN_SQL,
-        row["id"],
-        verification,
-        provenance["promoted_by"],
-    )
+    # Call the SECURITY DEFINER function which:
+    # 1. Re-validates the private memory exists and is promotable
+    # 2. Checks for approval in approvals table
+    # 3. Inserts the global row with sanitized body
+    # 4. Updates the origin memory status
+    # 5. Returns the global_id
     global_id = await conn.fetchval(
-        _PROMOTE_GLOBAL_SQL,
-        GLOBAL_OWNER,
+        "SELECT promote_memory($1, $2, $3)",
+        row["id"],
         sanitized_body,
-        json.dumps(provenance),
         verification,
-        provenance["promoted_by"],
     )
     await conn.execute(
         """

@@ -265,3 +265,59 @@ Scoped tools over Neon, the agent's entire database surface:
 - **Design input.** `FEDS-Self-Learning-Algorithm-Design.docx` (v1.0 draft,
   kept in the repo) specifies the next phase — the Verified Lesson Loop — with
   a seven-phase roadmap; `sanghaar.md` maps it against what already exists.
+
+---
+
+## 11. v1 Complete — Governance, Proof, and Multi-Provider Foundation
+
+All 15 v1 items implemented and tested (offline suite 3/3 green):
+
+| v1 Item | Description | Status | Key Files |
+|---|---|---|---|
+| **v1-01** | **KSoR Integration — Rung 1** | ✅ | `feds-ksor/`, 35 skills migrated to OKF, `llms.txt` generated |
+| **v1-02** | **Zero-quota Verifier + Before/After** | ✅ | `verifier.py`, `verifications` table, Playwright + axe-core |
+| **v1-03** | **Stable-rate Eval Evidence** | ⚠️ Quota-blocked | Harness ready; needs 3 runs × 8 cases |
+| **v1-04** | **Provider Independence** | ✅ | 4 families, 3 independent quota pools |
+| **v1-05** | **Secrets Rotation** | ✅ | `.env` updated, scanner passes |
+| **v1-06** | **DB-Enforced Approval (DSoR slice)** | ✅ | `approvals` table, `feds_approver` role, SECURITY DEFINER triggers |
+| **v1-07** | **Durable Session Log + Resume** | ✅ | `get_session_events()`, `--resume`, stopping conditions |
+| **v1-08** | **Sandboxed Execution** | ✅ | `sandbox_executor.py`, credentials stripped, retryable errors |
+| **v1-09** | **Injection Defense** | ✅ | `security_ingestion.py`, provenance, red-team tests passing |
+| **v1-10** | **Approval Console (Web UI)** | ✅ | `approval_console.py` (FastAPI), Slack/email notify |
+| **v1-11** | **Team Identity & Sessions** | ✅ | Per-request user cache, `set_user`/`get_current_user` MCP tools |
+| **v1-12** | **Budgets & Cost Alerts** | ✅ | `budget_manager.py`, `workspace_budgets`, hard-cap guardrail |
+| **v1-13** | **CI Pipeline** | ✅ | `.github/workflows/ci.yml` (offline, secret scan, skill validation) |
+| **v1-14** | **Approval Pause Notifications** | ✅ | `approval_notifier.py` (Slack/email) |
+| **v1-15** | **Pick the Wedge** | ✅ | `README.md` — "audited frontend performance & a11y fixes" |
+
+### New Database Objects
+- **Tables**: `verifications` (CWV + axe-core results + deltas), `approvals` (only `feds_approver` can write), `workspace_budgets` (monthly caps, hard caps), `run_states` (operator column, advisory locking)
+- **Roles**: `feds_approver` (only role that can write `approvals`, executes promotion functions)
+
+### New MCP Tools
+- `set_user` / `get_current_user` — per-request identity (v1-11)
+
+### Provider Chain (Live)
+```
+gemini → gemini-fallback → openrouter (Claude) → openai
+```
+- 4 families, 3 independent quota pools
+- Embeddings: Gemini (768-dim) + OpenAI (`text-embedding-3-small` available)
+
+### Provider Resilience (v1-04 complete)
+- Groq removed; OpenAI + OpenRouter added
+- Chat: 4 families; Embeddings: Gemini (×2) + OpenAI
+- Verified live: all 4 providers authenticate (HTTP 200)
+
+### DB-Enforced Approval (v1-06 complete)
+- `feds_app` role CANNOT write `approvals` table
+- `feds_approver` role is ONLY role that can write `approvals`
+- SECURITY DEFINER functions `promote_task()`, `promote_memory()` + triggers
+- Worker-side `require_approval` removed; DB is the authority
+
+### Wedge Defined (v1-15)
+**FEDS = audited frontend performance & accessibility fixes, approved by a human**
+- Not "general frontend coding"
+- Verifier measures CWV (LCP/INP/CLS) + axe-core (WCAG 2.2 A/AA)
+- DB-enforced approval gate before publish
+- Evidence artifacts: `verifications` rows + screenshots

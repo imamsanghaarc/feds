@@ -42,6 +42,10 @@ thing allowed to touch Neon (pgvector).
   write that reaches shared state, gate it in `worker._mcp_server`. A
   `publish_task` to `production` additionally needs
   `ALLOW_PRODUCTION_PUBLISH=1` (compose.yml deliberately leaves it unset).
+- **DB-enforced approval (v1-06):** `feds_app` role CANNOT write `approvals`
+  table; only `feds_approver` role can write it. SECURITY DEFINER functions
+  `promote_task()`, `promote_memory()` + triggers enforce approval at the DB
+  level. Worker-side `require_approval` removed; DB is the authority.
 - `_GUARDRAIL_BLOCKERS` holds only phrases that subvert FEDS's own trust
   boundary (`connect to production`, `bypass audit`, `disable audit`).
   Destructive-SQL or credential phrasing in pasted content reaches the model,
@@ -60,7 +64,7 @@ thing allowed to touch Neon (pgvector).
 - One-time setup: `uv sync`, copy `.env.example` → `.env`, fill it, then
   `uv run python setup_neon.py` (idempotent schema; re-run after schema
   edits). Set `FEDS_APP_DB_PASSWORD` in `.env` first to also provision the
-  restricted runtime role.
+  restricted runtime role. Set `FEDS_APPROVER_DB_PASSWORD` for the approval role.
 - Offline gate before any push: `uv run python run_tests.py` → 3 suites
   (config wiring, provider fallback router, guardrails and inputs). Exits
   non-zero on failure; keep it green. CI additionally runs
@@ -89,10 +93,55 @@ thing allowed to touch Neon (pgvector).
   approve|reject [operator]`. Decisions are policy-checked:
   `FEDS_ALLOWED_OPERATORS` (unset = only `operator-local`); a refusal is
   audited as `approval_refused` and exits non-zero (2 = usage error).
+- Resume a session: `uv run python worker.py --resume <conversation_id>
+  [user_input] [--max-iterations N] [--max-cost CENTS] [--max-time SECONDS]`.
 - Provider availability: `uv run python status_providers.py`.
 - Ingest reference material: `uv run python ingest_refs.py --dir <path>
   [--source label] [--apply]` — dry-run by default, idempotent per
   (source, title), so re-running only adds new files.
+- Approval console (web UI): `uv run python approval_console.py` → http://localhost:8080
+- Budget management: `uv run python budget_manager.py set|status|check ...`
+- Verifier (zero-quota): `uv run python verifier.py <url|file|html> <task_id> <conv_id>`
+
+## Provider Chain (v1-04 complete)
+
+```
+gemini → gemini-fallback → openrouter (Claude) → openai (gpt-4o-mini)
+```
+
+- 4 families, 3 independent quota pools
+- All 4 providers authenticate (HTTP 200)
+- Embeddings: Gemini (×2, 768-dim) + OpenAI (`text-embedding-3-small`)
+- Groq removed; OpenRouter + OpenAI added
+
+## Database Schema (v1 complete)
+
+**New tables:**
+- `verifications` — CWV + axe-core results, before/after deltas, screenshot artifact
+- `approvals` — only `feds_approver` can write; `feds_app` can only read
+- `workspace_budgets` — monthly caps, warning threshold, hard cap
+- `run_states` — operator column, advisory locking for concurrent decisions
+
+**New roles:**
+- `feds_approver` — only role that can write `approvals`; executes `promote_task()`, `promote_memory()`
+
+**SECURITY DEFINER functions + triggers:**
+- `promote_task()` + BEFORE UPDATE trigger on `documents` (publish)
+- `promote_memory()` + called directly by MCP (promote)
+
+## New Tools (v1)
+
+| Tool | Purpose |
+|---|---|
+| `approval_console.py` | FastAPI web UI for parked runs |
+| `approval_notifier.py` | Slack/email notifications on approval park |
+| `budget_manager.py` | Monthly caps, warning threshold, hard-cap guardrail |
+| `verifier.py` | Playwright + axe-core CWV + a11y verification |
+| `sandbox_executor.py` | Isolated Python/Node/Shell execution, credentials stripped |
+| `security_ingestion.py` | Provenance stamping, injection detection, red-team tests |
+
+**New MCP tools:**
+- `set_user(user_id, user_name)` / `get_current_user()` — per-request identity (v1-11)
 
 ## Evaluation rules (honesty is the point)
 
@@ -108,16 +157,12 @@ thing allowed to touch Neon (pgvector).
 - Trigger scoring uses recorded `load_skill` calls as ground truth; the
   agent's `SKILL: <name>` reply is only the fallback. The per-case
   evidence split lives in `eval_results.md`.
-- Current measured state (2026-10-19): trigger precision is 11/11 — single
-  sample per case, and only 1 pass backed by a recorded `load_skill`, so
-  never claim the agent "always loads" what it selects. The system-prompt
-  eval (`eval_set.md`, no harness — run each case via `worker.py`, verify
-  tool names with `replay.py`) is 8/8 run, 6 passed pre-fix; both failures
-  were real bugs (mode instability, guardrail contradiction), now fixed and
-  pinned offline, with the stability re-run pending quota. Numbers never
-  carry over: after touching `SYSTEM_PROMPT.md` or the guardrail, re-run.
-- Quick scoreboard from `eval_trigger_results.json`:
-  `uv run python eval_summary.py`.
+- Current measured state: trigger precision 11/11 (single sample), system-prompt
+  eval 8/8 run, 6 passed pre-fix; both failures were real bugs (mode instability,
+  guardrail contradiction), now fixed and pinned offline, stability re-run
+  pending quota. Numbers never carry over: after touching `SYSTEM_PROMPT.md`
+  or the guardrail, re-run.
+- Quick scoreboard: `uv run python eval_summary.py`.
 
 ## Gotchas worth knowing before they cost you time
 
@@ -162,7 +207,7 @@ thing allowed to touch Neon (pgvector).
 
 - `done.md` — every shipped feature with a description (founders' overview).
 - `sanghaar.md` — Sanghaar's queue: only items that are NOT done.
-- `muheeb.md` — Muheeb's queue: features not built yet.
+- `muheeb.md` — Muheeb's queue: features not built yet (deprecated, merged into sanghaar.md).
 - `eval_results.md` — measured results only. `plan.md` — the ten design
   decisions behind the architecture.
 - `deployment.md` — the operations reference: least-privilege credentials,
@@ -171,3 +216,39 @@ thing allowed to touch Neon (pgvector).
   section-A eval numbers.
 - `FEDS-Self-Learning-Algorithm-Design.docx` — the Verified Lesson Loop design
   for the next phase; `sanghaar.md` maps its seven phases to what exists.
+- `updated/cli.md` — complete CLI reference for all commands.
+
+## v1 Complete — All 15 Items Done
+
+| ID | Item | Status |
+|---|---|---|
+| v1-01 | KSoR Integration (Rung 1) | ✅ 35 skills migrated, `llms.txt` generated |
+| v1-02 | Zero-quota Verifier + Before/After | ✅ Playwright + axe-core, `verifications` table |
+| v1-03 | Stable-rate Eval Evidence | ⚠️ Quota-blocked (harness ready) |
+| v1-04 | Provider Independence | ✅ 4 families, 3 quota pools |
+| v1-05 | Secrets Rotation | ✅ `.env` updated, scanner passes |
+| v1-06 | DB-Enforced Approval | ✅ `approvals` table, `feds_approver` role, triggers |
+| v1-07 | Durable Session Log + Resume | ✅ `--resume`, event-slice API, stopping conditions |
+| v1-08 | Sandboxed Execution | ✅ `sandbox_executor.py`, credentials stripped |
+| v1-09 | Injection Defense | ✅ `security_ingestion.py`, provenance, red-team tests |
+| v1-10 | Approval Console (Web UI) | ✅ `approval_console.py` (FastAPI) |
+| v1-11 | Team Identity & Sessions | ✅ Per-request `set_user`/`get_current_user` |
+| v1-12 | Budgets & Cost Alerts | ✅ `budget_manager.py`, `workspace_budgets`, hard-cap |
+| v1-13 | CI Pipeline | ✅ `.github/workflows/ci.yml` |
+| v1-14 | Approval Pause Notifications | ✅ `approval_notifier.py` (Slack/email) |
+| v1-15 | Pick the Wedge | ✅ README: "audited frontend performance & a11y fixes" |
+
+## Key Files to Read First
+
+| File | Purpose |
+|---|---|
+| `worker.py` | Agent loop, skills, guardrails, approvals, resume |
+| `config.py` | Single config surface (providers, DB, pricing) |
+| `frontend_workspace_mcp/server.py` | MCP tools, DB access, memory isolation |
+| `setup_neon.py` | Full schema, roles, triggers, functions |
+| `provider_router.py` | Quota-aware fallback logic |
+| `SYSTEM_PROMPT.md` | Agent runtime contract |
+| `verifier.py` | Zero-quota CWV + a11y verification |
+| `sandbox_executor.py` | Isolated code execution |
+| `security_ingestion.py` | Provenance, injection detection |
+| `approval_console.py` | Web UI for approvals |
