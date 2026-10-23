@@ -86,7 +86,11 @@ def check_shape() -> None:
             "the fallback would exhaust with the primary"
         )
     assert config.EMBEDDING_DIMENSIONS == 768
-    for provider in config.embedding_order():
+    try:
+        embed_order = config.embedding_order()
+    except ValueError:
+        embed_order = []  # keyless run: no embedding provider to iterate
+    for provider in embed_order:
         assert provider in config.EMBEDDING_MODELS
 
     # A provider with no credential must never be counted as enabled.
@@ -104,10 +108,18 @@ def check_shape() -> None:
         if not key:
             assert not enabled, f"{name} is enabled without a credential"
 
+    try:
+        chat = config.chat_order()
+    except ValueError:
+        chat = []
+    try:
+        embed = config.embedding_order()
+    except ValueError:
+        embed = []
     print(
         "[PASS] credential shape and provider wiring look sane "
-        f"(configured={configured or 'none'}, chat={config.chat_order()}, "
-        f"embed={config.embedding_order()})"
+        f"(configured={configured or 'none'}, chat={chat or 'none'}, "
+        f"embed={embed or 'none'})"
     )
 
 

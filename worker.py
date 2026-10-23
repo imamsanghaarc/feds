@@ -221,7 +221,14 @@ HARDCODED_API_KEY = OPENAI_API_KEY
 HARDCODED_MODEL = OPENAI_CHAT_MODEL
 HARDCODED_BASE_URL = OPENAI_BASE_URL
 
-GEMINI_CHAT_ENABLED = "gemini" in chat_order()
+try:
+    _chat_order_at_import = chat_order()
+except ValueError:
+    # Keyless environment (fresh clone or CI with no .env): importing the
+    # worker must not fail — the failure belongs to the first turn, where
+    # require_config() reports it as an actionable message instead.
+    _chat_order_at_import = []
+GEMINI_CHAT_ENABLED = "gemini" in _chat_order_at_import
 
 
 def reload_config() -> None:

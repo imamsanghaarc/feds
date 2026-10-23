@@ -319,18 +319,29 @@ def require_config() -> list[str]:
             "still holds the schema owner credential. Point it at the restricted "
             "role created by setup_neon.py (FEDS_APP_DB_PASSWORD), or unset it."
         )
-    if not chat_order():
+    # chat_order()/embedding_order() raise when nothing is enabled; this
+    # function must instead *report* that as an actionable problem list.
+    try:
+        chat_ok = bool(chat_order())
+    except ValueError:
+        chat_ok = False
+    if not chat_ok:
         problems.append(
             "No chat provider is enabled. Set GEMINI_API_KEY (a second Gemini key "
             "can be added as GEMINI_FALLBACK_API_KEY), OPENROUTER_API_KEY, "
             "OLLAMA_API_KEY, or OPENAI_API_KEY in .env or the environment."
         )
-    if not problems and not embedding_order():
-        problems.append(
-            "No embedding provider is enabled. GEMINI_API_KEY (or "
-            "GEMINI_FALLBACK_API_KEY) must be set, because embeddings need a "
-            "provider of their own."
-        )
+    if not problems:
+        try:
+            embed_ok = bool(embedding_order())
+        except ValueError:
+            embed_ok = False
+        if not embed_ok:
+            problems.append(
+                "No embedding provider is enabled. GEMINI_API_KEY (or "
+                "GEMINI_FALLBACK_API_KEY) must be set, because embeddings need a "
+                "provider of their own."
+            )
     return problems
 
 

@@ -5,6 +5,7 @@ on:
     branches: [main, develop]
   pull_request:
     branches: [main, develop]
+  workflow_dispatch:
   schedule:
     # Daily live eval run at 03:00 UTC (when quota likely reset)
     - cron: '0 3 * * *'
@@ -160,15 +161,16 @@ jobs:
         run: uv sync --frozen
       
       - name: Validate skill tree
-        run: uv run python -c "
-import worker
-errors = worker.validate_skill_tree()
-if errors:
-    for e in errors:
-        print(e)
-    exit(1)
-print('Skill tree valid')
-"
+        run: |
+          uv run python -c "
+          import worker
+          errors = worker.validate_skill_tree()
+          if errors:
+              for e in errors:
+                  print(e)
+              exit(1)
+          print('Skill tree valid')
+          "
 
   # Ensure all jobs pass
   gate:
