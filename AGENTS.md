@@ -5,6 +5,31 @@ build step. At runtime it is two processes: `worker.py` (the agent loop)
 spawns the `frontend_workspace_mcp` server over stdio, which is the only
 thing allowed to touch Neon (pgvector).
 
+## Start here (first 15 minutes, human or agent)
+
+- Three surfaces, one codebase: `worker.py` (the agent loop, runnable
+  headless), `frontend_workspace_mcp/server.py` (the only process allowed to
+  touch Neon, spawned over stdio), and `feds_cli/` (the terminal TUI, which
+  imports the worker in-process — it never spawns it).
+- Read in this order: this file → `README.md` (product and wedge) →
+  `docs/plan.md` (the ten design decisions) → `sanghaar.md` (the open queue)
+  → `worker.py` + `config.py` (implementation) → `SYSTEM_PROMPT.md` (the
+  agent's contract; changing it invalidates the eval numbers).
+- Setup: `uv sync` (add `--extra cli` for the TUI), copy `.env.example` →
+  `.env` and fill it, `uv run python setup_neon.py`. Without a `.env` the
+  worker cannot run a turn or reach the database; the exact behavior of the
+  offline gate on a clean clone is not yet verified (see `## Open work`).
+- Definition of done for a change: `uv run python run_tests.py` green (3
+  suites, including the planted-secret scanner), no credentials anywhere in
+  the diff, then commit and confirm the push with `git ls-remote origin HEAD`.
+- Live checks are opt-in (`RUN_LIVE_TESTS=1`) and quota-bound; exit code 2 is
+  "quota skipped cases", never a pass. `eval_results.md` may contain only
+  numbers from real runs; NULL costs stay NULL.
+- Touching the TUI? Run `uv run python -m feds_cli.smoke [--live]` too (see
+  `feds_cli/README.md`).
+- If this file and the code disagree, the code and its tests win — fix this
+  file in the same commit.
+
 ## Identity and product rules (non-negotiable)
 
 - The official name is **FEDS** (Frontend Engineering Digital Specialist);
@@ -67,9 +92,10 @@ thing allowed to touch Neon (pgvector).
   restricted runtime role. Set `FEDS_APPROVER_DB_PASSWORD` for the approval role.
 - Offline gate before any push: `uv run python run_tests.py` → 3 suites
   (config wiring, provider fallback router, guardrails and inputs). Exits
-  non-zero on failure; keep it green. CI additionally runs
-  `uv run python test_config.py --strict`, which live-probes the credentials
-  and fails on a stale one.
+  non-zero on failure; keep it green. CI runs exactly this gate with
+  `RUN_LIVE_TESTS` unset. The live credential probe
+  `uv run python test_config.py --strict` (fails on a stale key) is manual
+  today — run it after touching `.env`, `config.py`, or provider wiring.
 - Zero-quota live schema proof: `uv run python smoke_memory_schema.py` runs
   the real promotion statements and the constraint/append-only probes inside
   a rolled-back transaction, so the memory rules are proven at the database
@@ -213,20 +239,28 @@ gemini → gemini-fallback → openrouter (Claude) → ollama (gpt-oss:120b) →
 
 ## Status ledgers (read before planning anything)
 
-- `done.md` — every shipped feature with a description (founders' overview).
-- `sanghaar.md` — Sanghaar's queue: only items that are NOT done.
-- `muheeb.md` — Muheeb's queue: features not built yet (deprecated, merged into sanghaar.md).
-- `eval_results.md` — measured results only. `plan.md` — the ten design
+- `updated/done.md` — every shipped feature with a description (founders'
+  overview).
+- `sanghaar.md` — Sanghaar's queue: only items that are NOT done (OPEN as of
+  v1: v1-16, D1–D3, then the v1.1/v2 plan).
+- `muheeb.md` — no longer exists; that queue was merged into `sanghaar.md`.
+- `eval_results.md` — measured results only. `docs/plan.md` — the ten design
   decisions behind the architecture.
-- `deployment.md` — the operations reference: least-privilege credentials,
-  connection settings, provider rotation semantics, trust boundaries.
+- `docs/deployment.md` — the operations reference: least-privilege
+  credentials, connection settings, provider rotation semantics, trust
+  boundaries.
 - `SYSTEM_PROMPT.md` — the agent's runtime contract; changes invalidate the
   section-A eval numbers.
-- `FEDS-Self-Learning-Algorithm-Design.docx` — the Verified Lesson Loop design
-  for the next phase; `sanghaar.md` maps its seven phases to what exists.
+- `docs/FEDS-Self-Learning-Algorithm-Design.docx` — the Verified Lesson Loop
+  design for the next phase; `sanghaar.md` maps its seven phases to what
+  exists.
 - `updated/cli.md` — complete CLI reference for all commands.
+- `feds_cli/README.md` — the terminal TUI: run instructions, keys, commands,
+  architecture, known gaps.
+- This file — the working contract for contributors and agents; the
+  `## Open work` section at the end lists what is missing right now.
 
-## v1 Complete — All 15 Items Done
+## v1 Status — 14 shipped, v1-03 evidence quota-blocked (v1-16 + D1–D3 still open)
 
 | ID | Item | Status |
 |---|---|---|
@@ -260,3 +294,50 @@ gemini → gemini-fallback → openrouter (Claude) → ollama (gpt-oss:120b) →
 | `sandbox_executor.py` | Isolated code execution |
 | `security_ingestion.py` | Provenance, injection detection |
 | `approval_console.py` | Web UI for approvals |
+| `feds_cli/main.py` | Textual TUI: banner, screens, widgets, slash commands |
+| `feds_cli/worker_bridge.py` | In-process worker calls, stdio restoration, snapshots |
+| `feds_cli/smoke.py` | Headless TUI regression check (no TTY needed) |
+
+## Open work — what is missing
+
+`sanghaar.md` holds the prioritized queue with estimates (items marked
+**OPEN**); this section is the short list an outside contributor can act on
+today. Close an item by updating this table in the same PR.
+
+### FEDS CLI (`feds_cli/`) — good first issues
+
+| Gap | Files | Done when |
+|---|---|---|
+| No token streaming: a turn appears only when the worker prints its final answer | `worker.py` (`run_task` needs an `on_token` hook beside `_say`/`_CAPTURE`), `feds_cli/worker_bridge.py`, `feds_cli/main.py` | text renders incrementally in `ChatView`, `uv run python -m feds_cli.smoke --live` still passes, headless worker output unchanged |
+| `/model` prints the chain but cannot switch; changing models means editing `.env` and restarting | `feds_cli/main.py`, `feds_cli/worker_bridge.py` | a model picked in the TUI is used by the next turn, shown in the status bar, pinned by an offline test |
+| `/compact` and `/update` announce a plan instead of acting | `feds_cli/main.py` | `/compact` shrinks the stored context and reports the delta; `/update` performs a real check and degrades gracefully offline |
+| Context panel gaps: live provider cooldown state is absent; `skills_loaded` never fills from `load_skill` calls | `feds_cli/main.py`, `feds_cli/worker_bridge.py`, `worker.py` | panel reflects the router's current cooldowns and lists skills loaded that turn |
+| Prompt ergonomics: no tab completion for slash commands or skills; history only on Ctrl+Up/Down (plain Up/Down must keep moving the cursor in the prompt — do not rebind it) | `feds_cli/main.py` | Tab completes without breaking `TextArea` cursor movement; the smoke test covers it |
+| `/cost` has only been observed on zero-cost (free-tier) turns; unpriced rows must stay NULL, never 0 | `feds_cli/worker_bridge.py` | a turn on a priced model shows non-zero cents and NULL still renders as unpriced |
+| Not verified on a clean clone: `uv sync --extra cli` + `uv run python -m feds_cli.smoke` should pass with no `.env` at all — confirm, then pin it in `feds_cli/README.md` | `feds_cli/smoke.py` | documented after a real no-`.env` run |
+
+### CI and repository hygiene
+
+| Gap | Where | Done when |
+|---|---|---|
+| CI never builds or exercises the TUI: the workflow syncs `--frozen` (no `--extra cli`) and runs only `run_tests.py` | `.github/workflows/ci.yml` | a job runs `uv sync --extra cli` then `uv run python -m feds_cli.smoke` on Linux |
+| No credential probe in CI (`test_config.py --strict` is manual) | `.github/workflows/ci.yml` | a scheduled/dispatch job runs `--strict` with repository secrets and fails on a stale key |
+| No `LICENSE` — do not invent one; the owner chooses (MIT or Apache-2.0) first | repo root | license file exists and `README.md` links it |
+| No `CODE_OF_CONDUCT.md` and no pull-request template (two issue templates exist) | `.github/` | added once the license question is settled |
+| `README.md` never mentions the TUI (`uv run feds`) and its quick start is PowerShell-only | `README.md` | quick start shows PowerShell, cmd, and bash (macOS/Linux) |
+| Containers untested: `Dockerfile`/`compose.yml` were reviewed but never run (no Docker in the dev environment) | `Dockerfile`, `compose.yml` | CI builds the image, or the README labels the container path untested |
+| Ledger drift: `updated/done.md` covers v1-01…v1-15 but not the FEDS CLI (`feds_cli`) or the Ollama provider (D2) | `updated/done.md` | done.md lists the CLI and Ollama work too; sanghaar.md holds only open work |
+| Cross-platform: everything was verified on Windows (PowerShell/cmd) plus a headless harness — macOS/Linux only have the CI signal | `feds_cli/` | a manual pass on macOS and Linux is recorded in `feds_cli/README.md` |
+
+### Needs a plan, not a drive-by change
+
+- **v1-16 / D1 — nervous system (durable execution):** three-layer engine
+  (senses, reflexes, balance), zero-import and swap-ready across
+  Inngest/Temporal/Restate/Dapr; specs in `sanghaar.md` and
+  `updated/nervous-system.md`.
+- **v1-03 — stable-rate eval evidence:** harness ready, runs quota-blocked;
+  exit code 2 is never a pass and the numbers may never be fabricated.
+- **D2/D3 — status docs and market-report traceability:** update ledgers and
+  the gap→coverage→evidence table as items land.
+- **KSoR/DSoR beyond Rung 1:** see the implementation notes at the end of
+  `sanghaar.md` (least privilege, no ungoverned mixing into `embeddings`).
