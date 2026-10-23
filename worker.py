@@ -451,6 +451,25 @@ def try_make_sandbox_client():
             return None
 
 
+# When set by an in-process caller (the CLI), turn output is collected here
+# instead of being written to the terminal.
+_CAPTURE: dict[str, list[str]] | None = None
+
+
+def _say(message: str, *, error: bool = False) -> None:
+    """Emit one human-facing line, or collect it when a caller is capturing.
+
+    The CLI imports this module in-process, so a bare `print` would write
+    straight into the Textual screen. A caller sets `_CAPTURE` to a dict and
+    gets the same text back instead, which keeps `uv run python worker.py`
+    behaving exactly as before.
+    """
+    if _CAPTURE is not None:
+        _CAPTURE.setdefault("err" if error else "out", []).append(str(message))
+        return
+    print(message, file=sys.stderr if error else sys.stdout)
+
+
 def build_model():
     """Return a chat model that survives either provider running out of quota.
 
@@ -487,7 +506,7 @@ def _chat_router() -> ProviderRouter:
         _CHAT_ROUTER = ProviderRouter(
             _build_chat_providers(),
             cooldown_seconds=PROVIDER_COOLDOWN_SECONDS,
-            on_event=lambda message: print(message, file=sys.stderr),
+            on_event=lambda message: _say(message, error=True),
         )
     return _CHAT_ROUTER
 
@@ -539,10 +558,7 @@ class FallbackChatModel(OpenAIChatCompletionsModel):
 
         result, provider = await self._chat_router.run(attempt)
         self._last_provider = provider.name
-        print(
-            f"[model] {self._label_for(provider.name)}",
-            file=sys.stderr,
-        )
+        _say(f"[model] {self._label_for(provider.name)}", error=True)
         return result
 
     async def stream_response(self, *args, **kwargs):
@@ -561,7 +577,7 @@ class FallbackChatModel(OpenAIChatCompletionsModel):
 
         (iterator, first), provider = await self._chat_router.run(attempt)
         self._last_provider = provider.name
-        print(f"[model] {self._label_for(provider.name)} (stream)", file=sys.stderr)
+        _say(f"[model] {self._label_for(provider.name)} (stream)", error=True)
         return _prefetched_stream(iterator, first)
 
 
@@ -900,7 +916,7 @@ async def resume_session(
     
     if parked_row:
         # Resume the parked approval via existing decide_run path
-        print(f"Resuming parked approval: run_id={parked_row['run_id']}")
+        _say(f"Resuming parked approval: run_id={parked_row['run_id']}")
         await decide_run(parked_row['run_id'], "approve", "operator-local")
         return
     
@@ -927,13 +943,13 @@ async def resume_session(
             # Check cost limit
             if max_cost_cents and total_cost >= max_cost_cents:
                 await _audit_stop(conversation_id, "max_cost_cents", total_cost)
-                print(f"Stopped: max cost ({max_cost_cents} cents) reached")
+                _say(f"Stopped: max cost ({max_cost_cents} cents) reached")
                 break
             
             # Check wall clock limit
             if wall_clock_limit and (time.perf_counter() - start_time) > wall_clock_limit:
                 await _audit_stop(conversation_id, "wall_clock_limit", time.perf_counter() - start_time)
-                print(f"Stopped: wall clock limit ({wall_clock_limit}s) reached")
+                _say(f"Stopped: wall clock limit ({wall_clock_limit}s) reached")
                 break
             
             iteration += 1
@@ -969,12 +985,12 @@ async def resume_session(
                         "tool_name": tool_names,
                         "state_text": run_state.to_string(),
                     })
-                print(f"Approval required: run_id={run_id} tool={tool_names}")
+                _say(f"Approval required: run_id={run_id} tool={tool_names}")
                 break
             
             final_output = str(result.final_output).strip() if result.final_output else ""
             if final_output:
-                print(final_output)
+                _say(final_output)
             
             user_input = ""  # Only use initial input once
     
@@ -1002,17 +1018,19 @@ async def _audit_stop(conversation_id: str, reason: str, detail: Any) -> None:
         pass  # Best effort
 
 
-async def run_task(user_input: str) -> None:
+async def run_task(user_input: str, conversation_id: str | None = None) -> None:
     global _CURRENT_CONVERSATION_ID
 
     if not user_input.strip():
-        print(EMPTY_INPUT)
+        _say(EMPTY_INPUT)
         return
 
     agent, sandbox_client = build_agent()
     user_input = user_input.strip()
 
-    conversation_id = uuid.uuid4().hex
+    # The CLI passes its own session id so a conversation survives restarts and
+    # `--resume` can pick it up. A bare CLI run keeps the historical behaviour.
+    conversation_id = conversation_id or uuid.uuid4().hex
     _CURRENT_CONVERSATION_ID = conversation_id
     engine_url = DATABASE_URL.split("?", 1)[0].replace("postgresql://", "postgresql+asyncpg://", 1)
     engine = create_async_engine(
@@ -1142,7 +1160,7 @@ async def run_task(user_input: str) -> None:
                 {"run_id": run_id, "event": "approval_pending"},
                 {"status": "awaiting"},
             )
-            print(
+            _say(
                 "Approval required before completion: "
                 f"run_id={run_id} tool={tool_names}. "
                 f"Approve or reject it separately, then run: uv run python worker.py --decide {run_id} approve"
@@ -1151,9 +1169,9 @@ async def run_task(user_input: str) -> None:
 
         final_output = str(result.final_output).strip() if result.final_output is not None else ""
         if not final_output:
-            print(NO_OUTPUT)
+            _say(NO_OUTPUT)
         else:
-            print(final_output)
+            _say(final_output)
 
         async with engine.begin() as db:
             await db.execute(
@@ -1183,9 +1201,13 @@ async def run_task(user_input: str) -> None:
                 },
             )
     except InputGuardrailTripwireTriggered:
-        print("Guardrail blocked this request. No model processing or persistence occurred.")
+        _say("Guardrail blocked this request. No model processing or persistence occurred.")
     except Exception as exc:
-        print(SKILL_FAILURE.format(error=exc))
+        _say(SKILL_FAILURE.format(error=exc))
+        if os.getenv("FEDS_DEBUG"):
+            import traceback as _traceback
+
+            _say("[debug] traceback follows:\n" + _traceback.format_exc())
     finally:
         await engine.dispose()
         _CURRENT_CONVERSATION_ID = None

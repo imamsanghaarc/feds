@@ -110,6 +110,22 @@ OPENROUTER_CHAT_MODEL = os.getenv("OPENROUTER_CHAT_MODEL", "anthropic/claude-hai
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_ENABLED = bool(OPENROUTER_API_KEY) and os.getenv("OPENROUTER_ENABLED", "1") != "0"
 
+# Ollama Cloud: chat only on this account (no embedding model is exposed), so it
+# is deliberately absent from EMBEDDING_MODELS. The official `ollama` client is
+# used for credential/entitlement probing (status_providers.py, test_config.py);
+# the agent loop talks to the OpenAI-compatible endpoint on the same host
+# because the SDK needs tool calls and streaming, which that endpoint serves.
+#
+# Model choice matters: cloud models are rolled out per plan. A free-plan key
+# gets 402 for Pro models and 410 for retired ones, so re-check the catalog with
+# `uv run python -c "import ollama,os; ..."` or status_providers.py rather than
+# guessing a name. gpt-oss:120b was verified to answer and emit tool calls.
+OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "https://ollama.com")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", f"{OLLAMA_HOST.rstrip('/')}/v1")
+OLLAMA_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "gpt-oss:120b")
+OLLAMA_ENABLED = bool(OLLAMA_API_KEY) and os.getenv("OLLAMA_ENABLED", "1") != "0"
+
 # --- Embeddings --------------------------------------------------------------
 
 # Every embedding provider must agree on dimensionality; pgvector columns are
@@ -253,6 +269,12 @@ _CHAT_PROVIDERS: dict[str, dict[str, object]] = {
         "base_url": OPENROUTER_BASE_URL,
         "api_key": OPENROUTER_API_KEY,
     },
+    "ollama": {
+        "enabled": OLLAMA_ENABLED,
+        "model": OLLAMA_CHAT_MODEL,
+        "base_url": OLLAMA_BASE_URL,
+        "api_key": OLLAMA_API_KEY,
+    },
     "openai": {
         "enabled": OPENAI_ENABLED,
         "model": OPENAI_CHAT_MODEL,
@@ -262,8 +284,9 @@ _CHAT_PROVIDERS: dict[str, dict[str, object]] = {
     }
 
 # Preference order for chat. Gemini leads; the fallback key covers its quota
-# gaps; OpenRouter adds multi-model routing; OpenAI as final fallback.
-CHAT_PREFERENCE = ("gemini", "gemini-fallback", "openrouter", "openai")
+# gaps; OpenRouter adds multi-model routing; Ollama Cloud is a separate quota
+# pool (free-plan capped) and OpenAI remains the final fallback.
+CHAT_PREFERENCE = ("gemini", "gemini-fallback", "openrouter", "ollama", "openai")
 
 CHAT_MODELS = {
     name: {"model": cfg["model"], "base_url": cfg["base_url"], "api_key": cfg["api_key"]}
@@ -299,7 +322,8 @@ def require_config() -> list[str]:
     if not chat_order():
         problems.append(
             "No chat provider is enabled. Set GEMINI_API_KEY (a second Gemini key "
-            "can be added as GEMINI_FALLBACK_API_KEY) or GROQ_API_KEY in .env or the environment."
+            "can be added as GEMINI_FALLBACK_API_KEY), OPENROUTER_API_KEY, "
+            "OLLAMA_API_KEY, or OPENAI_API_KEY in .env or the environment."
         )
     if not problems and not embedding_order():
         problems.append(

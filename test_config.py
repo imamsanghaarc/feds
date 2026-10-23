@@ -63,6 +63,7 @@ def check_shape() -> None:
         ("gemini", config.GEMINI_API_KEY),
         ("gemini-fallback", config.GEMINI_FALLBACK_API_KEY),
         ("openrouter", config.OPENROUTER_API_KEY),
+        ("ollama", config.OLLAMA_API_KEY),
     ):
         if not key:
             print(f"[SKIP] {name} has no key configured (provider disabled)")
@@ -98,6 +99,7 @@ def check_shape() -> None:
             config.ENABLED_FLAGS.get("gemini-fallback", False),
         ),
         ("openrouter", config.OPENROUTER_API_KEY, config.OPENROUTER_ENABLED),
+        ("ollama", config.OLLAMA_API_KEY, config.OLLAMA_ENABLED),
     ):
         if not key:
             assert not enabled, f"{name} is enabled without a credential"
@@ -120,6 +122,7 @@ def check_no_secrets_in_source() -> None:
     patterns = {
         "gemini-style key": re.compile(r"AQ\.[A-Za-z0-9_\-]{30,}"),
         "openai-style key": re.compile(r"sk-proj-[A-Za-z0-9_\-]{80,}"),
+        "ollama-style key": re.compile(r"\b[0-9a-f]{32}\.[A-Za-z0-9_\-]{24,}"),
         "postgres password": re.compile(r"postgresql://[^:]+:([A-Za-z0-9_\-]{8,})@"),
     }
     # Obvious placeholders in documentation and .env.example are not credentials.
@@ -200,6 +203,28 @@ def _openrouter_key_valid(key: str) -> tuple[bool, str]:
         return False, f"{type(exc).__name__}"
 
 
+def _ollama_key_valid(key: str) -> tuple[bool, str]:
+    """Validate an Ollama Cloud key with the official client (no chat quota).
+
+    A catalog listing proves the credential; model entitlement is a separate
+    concern and is reported by `status_providers.py`.
+    """
+    try:
+        import ollama
+    except ImportError:
+        return False, "ollama package missing"
+    try:
+        client = ollama.Client(
+            host=config.OLLAMA_HOST,
+            headers={"Authorization": f"Bearer {key}"},
+        )
+        listing = client.list()
+        return True, f"HTTP 200, {len(listing.get('models', []))} models"
+    except Exception as exc:  # noqa: BLE001
+        status = getattr(exc, "status_code", None)
+        return False, f"HTTP {status}" if status else type(exc).__name__
+
+
 def check_live_credentials(strict: bool) -> int:
     """Verify each configured key authenticates.
 
@@ -213,6 +238,7 @@ def check_live_credentials(strict: bool) -> int:
         ("gemini", lambda: _gemini_key_valid(config.GEMINI_API_KEY)),
         ("gemini-fallback", lambda: _gemini_key_valid(config.GEMINI_FALLBACK_API_KEY)),
         ("openrouter", lambda: _openrouter_key_valid(config.OPENROUTER_API_KEY)),
+        ("ollama", lambda: _ollama_key_valid(config.OLLAMA_API_KEY)),
     ):
         valid, detail = probe()
         if valid:

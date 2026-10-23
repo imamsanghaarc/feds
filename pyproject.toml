@@ -17,8 +17,18 @@ dependencies = [
   "fastapi>=0.110.0",
   "uvicorn>=0.29.0",
   "jinja2>=3.1.0",
+  "ollama>=0.6.3",
 ]
 
+optional-dependencies = { cli = ["textual>=0.85", "rich>=13.9", "prompt-toolkit>=3.0", "httpx>=0.27", "platformdirs>=4.3"] }
+
+[project.scripts]
+feds = "feds_cli.main:main"
+
 [tool.uv]
-# The project is a standalone worker script, not an installable package.
-package = false
+# The project is now an installable package with CLI entry point.
+package = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["feds_cli*"]

@@ -89,6 +89,9 @@ thing allowed to touch Neon (pgvector).
   inside `run_tests.py`, `eval_triggers.py`, and `test_approval_gate.py`.
 - One agent turn: `uv run python worker.py "prompt"`. Inspect afterwards:
   `uv run python replay.py <conversation_id>`.
+- Interactive TUI (opencode-style, same in-process worker): `uv sync --extra cli`
+  then `uv run feds` from the repo root; headless check with
+  `uv run python -m feds_cli.smoke [--live]`. See `feds_cli/README.md`.
 - Resume a parked approval: `uv run python worker.py --decide <run_id>
   approve|reject [operator]`. Decisions are policy-checked:
   `FEDS_ALLOWED_OPERATORS` (unset = only `operator-local`); a refusal is
@@ -106,12 +109,17 @@ thing allowed to touch Neon (pgvector).
 ## Provider Chain (v1-04 complete)
 
 ```
-gemini → gemini-fallback → openrouter (Claude) → openai (gpt-4o-mini)
+gemini → gemini-fallback → openrouter (Claude) → ollama (gpt-oss:120b) → openai (gpt-4o-mini)
 ```
 
-- 4 families, 3 independent quota pools
-- All 4 providers authenticate (HTTP 200)
+- 5 provider entries, 4 independent quota pools
+- All providers authenticate (HTTP 200)
 - Embeddings: Gemini (×2, 768-dim) + OpenAI (`text-embedding-3-small`)
+- Ollama Cloud is chat-only on this account and its models are plan-gated: a
+  free-plan key answers 402 for Pro models and 410 for retired ones. Probe with
+  `uv run python status_providers.py` before changing `OLLAMA_CHAT_MODEL`; the
+  health check itself uses the official `ollama` client, while the agent loop
+  uses `https://ollama.com/v1` (OpenAI-compatible, tool calls + streaming).
 - Groq removed; OpenRouter + OpenAI added
 
 ## Database Schema (v1 complete)

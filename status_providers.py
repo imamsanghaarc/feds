@@ -78,6 +78,55 @@ def _gemini_status(key: str):
         return -1, f"{type(exc).__name__}: {exc}"
 
 
+def _ollama_status(key: str):
+    """Probe Ollama Cloud through the official `ollama` client.
+
+    Listing proves the credential; a tiny chat proves the configured model is
+    actually enabled for this plan. Both are needed: a valid key can still get
+    402 for a Pro-only model or 410 for a retired one.
+    """
+    try:
+        import ollama
+    except ImportError:
+        return -1, "ollama package missing; run: uv sync"
+
+    client = ollama.Client(
+        host=config.OLLAMA_HOST,
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    try:
+        listing = client.list()
+        names = [
+            entry.get("model") or entry.get("name")
+            for entry in listing.get("models", [])
+        ]
+        model = config.OLLAMA_CHAT_MODEL
+        if model not in names:
+            return (
+                200,
+                f"credential works, but {model!r} is not in this account's "
+                f"catalog ({len(names)} models); set OLLAMA_CHAT_MODEL",
+            )
+        client.chat(
+            model=model,
+            messages=[{"role": "user", "content": "ping"}],
+            options={"num_predict": 4},
+        )
+        return 200, f"works, {len(names)} models, {model} answers"
+    except Exception as exc:  # noqa: BLE001
+        status = getattr(exc, "status_code", None) or -1
+        detail = str(exc).replace("\n", " ")
+        if status == 402:
+            return 402, "valid but model is outside this plan; change OLLAMA_CHAT_MODEL"
+        if status == 410:
+            return 410, "model retired for this account; change OLLAMA_CHAT_MODEL"
+        if status == 429:
+            return 429, "valid but quota exhausted"
+        if status in (401, 403):
+            return status, "credential rejected"
+        return status, detail[:80]
+
+
 # Each probe is a real model call, so only configured credentials are probed.
 _PROBES = {}
 if config.GEMINI_API_KEY:
@@ -86,6 +135,8 @@ if config.GEMINI_FALLBACK_API_KEY:
     _PROBES["gemini-fb"] = lambda: _gemini_status(config.GEMINI_FALLBACK_API_KEY)
 if config.OPENAI_API_KEY:
     _PROBES["openai"] = lambda: openai_status(config.OPENAI_API_KEY)
+if config.OLLAMA_API_KEY:
+    _PROBES["ollama"] = lambda: _ollama_status(config.OLLAMA_API_KEY)
 
 unconfigured = [name for name, on in config.ENABLED_FLAGS.items() if not on]
 if unconfigured:

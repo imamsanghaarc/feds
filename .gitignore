@@ -25,3 +25,6 @@ tmp/
 .agents/
 .DS_Store
 Thumbs.db
+
+# FEDS CLI session transcripts (repo-local store, see feds_cli/session.py)
+.feds/
