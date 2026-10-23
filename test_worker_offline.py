@@ -646,7 +646,13 @@ def test_single_publish_path_and_approval_gate() -> None:
             config.CHAT_MODELS[_name]["api_key"] = _key
     names = [tool.name for tool in agent.tools]
     check("publish_asset is not a local tool", "publish_asset" not in names, str(names))
-    check("load_skill remains available", "load_skill" in names, str(names))
+    if isinstance(agent, worker.SandboxAgent):
+        # Sandbox hosts resolve skills through the SDK's Skills capability,
+        # so this path deliberately carries no local tools (build_agent);
+        # only the native Windows fallback exposes a load_skill tool.
+        check("sandbox path carries no local tools", names == [], str(names))
+    else:
+        check("load_skill remains available", "load_skill" in names, str(names))
 
     # Verify DB-enforced approval architecture: triggers exist in schema
     # This is tested in setup_neon.py smoke tests, not here.
