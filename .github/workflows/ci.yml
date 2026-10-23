@@ -21,7 +21,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       
       - name: Install uv
         run: |
@@ -29,12 +29,12 @@ jobs:
           echo "$HOME/.local/bin" >> $GITHUB_PATH
       
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       
       - name: Cache uv
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/uv
           key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
@@ -52,7 +52,7 @@ jobs:
       
       - name: Upload test results
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-results
           path: |
@@ -77,7 +77,7 @@ jobs:
       FEDS_ALLOWED_OPERATORS: ${{ secrets.FEDS_ALLOWED_OPERATORS }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       
       - name: Install uv
         run: |
@@ -85,12 +85,12 @@ jobs:
           echo "$HOME/.local/bin" >> $GITHUB_PATH
       
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       
       - name: Cache uv
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/uv
           key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
@@ -116,7 +116,7 @@ jobs:
           RUN_LIVE_TESTS: "1"
       
       - name: Upload eval results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: eval-results
           path: |
@@ -128,7 +128,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
       
@@ -145,7 +145,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       
       - name: Install uv
         run: |
@@ -153,7 +153,7 @@ jobs:
           echo "$HOME/.local/bin" >> $GITHUB_PATH
       
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       
