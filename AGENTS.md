@@ -255,6 +255,10 @@ gemini → gemini-fallback → openrouter (Claude) → ollama (gpt-oss:120b) →
   design for the next phase; `sanghaar.md` maps its seven phases to what
   exists.
 - `updated/cli.md` — complete CLI reference for all commands.
+- `ROADMAP.md` — curated contributor view of the queue; `sanghaar.md` stays
+  the source of truth, so never add roadmap-only work.
+- `docs/extending-feds.md` — how to add a skill, an MCP tool, or a standalone
+  integration (`templates/skill/SKILL.md` is the copyable boilerplate).
 - `feds_cli/README.md` — the terminal TUI: run instructions, keys, commands,
   architecture, known gaps.
 - This file — the working contract for contributors and agents; the
@@ -322,8 +326,7 @@ today. Close an item by updating this table in the same PR.
 |---|---|---|
 | CI never builds or exercises the TUI: the workflow syncs `--frozen` (no `--extra cli`) and runs only `run_tests.py` | `.github/workflows/ci.yml` | a job runs `uv sync --extra cli` then `uv run python -m feds_cli.smoke` on Linux |
 | No credential probe in CI (`test_config.py --strict` is manual) | `.github/workflows/ci.yml` | a scheduled/dispatch job runs `--strict` with repository secrets and fails on a stale key |
-| No `LICENSE` — do not invent one; the owner chooses (MIT or Apache-2.0) first | repo root | license file exists and `README.md` links it |
-| No `CODE_OF_CONDUCT.md` and no pull-request template (two issue templates exist) | `.github/` | added once the license question is settled |
+| No pull-request template (CONTRIBUTING.md, CODE_OF_CONDUCT.md, and both issue templates exist) | `.github/` | a PR template points authors at AGENTS.md → Start here for the definition of done |
 | `README.md` never mentions the TUI (`uv run feds`) and its quick start is PowerShell-only | `README.md` | quick start shows PowerShell, cmd, and bash (macOS/Linux) |
 | Containers untested: `Dockerfile`/`compose.yml` were reviewed but never run (no Docker in the dev environment) | `Dockerfile`, `compose.yml` | CI builds the image, or the README labels the container path untested |
 | Ledger drift: `updated/done.md` covers v1-01…v1-15 but not the FEDS CLI (`feds_cli`) or the Ollama provider (D2) | `updated/done.md` | done.md lists the CLI and Ollama work too; sanghaar.md holds only open work |

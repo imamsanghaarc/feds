@@ -6,6 +6,7 @@
 [![FEDS CI](https://github.com/imamsanghaarc/feds/actions/workflows/ci.yml/badge.svg)](https://github.com/imamsanghaarc/feds/actions/workflows/ci.yml)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 ![uv](https://img.shields.io/badge/uv-managed-orange)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ---
 
@@ -135,6 +136,61 @@ and three workflow skills (`summarize-component`, `find-similar-components`,
   model or persistence work happens.
 - Every stored embedding records the model that produced it, so vectors from
   different providers are never compared.
+
+### By domain (backend, data, and platform contributors)
+
+#### Backend / API
+
+| Surface | Where | Notes |
+|---|---|---|
+| Agent loop | `worker.py` | turns, skills, guardrails, approval parking, `--resume` |
+| MCP tool API | `frontend_workspace_mcp/server.py` | ~10 scoped tools; stdio is how the worker calls it |
+| Optional HTTP MCP | `compose.yml` service `mcp-http` | streamable-http on `127.0.0.1:8001`, opt-in profile — the agent itself stays stdio |
+| Approval console | `approval_console.py` | FastAPI on `:8080` for parked runs |
+| Provider routing | `provider_router.py` | quota-aware fallback; only 429/402 rotate |
+
+There is no other REST layer: the worker talks to the MCP server over stdio
+and to model providers over their OpenAI/Anthropic-compatible endpoints.
+
+#### Database & state
+
+| Concern | Choice |
+|---|---|
+| Store | Neon Postgres + pgvector (HNSW); schema in `setup_neon.py` |
+| Drivers | psycopg 3 (MCP server path), SQLAlchemy async + asyncpg (tooling) |
+| Migrations | none — all DDL ships idempotently in `setup_neon.py`; the runtime role cannot run DDL (an offline test pins this) |
+| Roles | owner (`NEON_DATABASE_URL`, setup/ingest only), `feds_app` least-privilege runtime, `feds_approver` (only writer of `approvals`) |
+| Key tables | `documents`, `memories`, `verifications`, `approvals`, `workspace_budgets`, `run_states`, `audit_log`, `capability_invocations` |
+| Session state | worker: `audit_log` event slices + `--resume`; TUI: one JSON file per session under `.feds/sessions/` |
+| Caching | none yet — retrieval reads pgvector directly (see `ROADMAP.md`) |
+
+#### DevOps & infrastructure
+
+- **CI:** `.github/workflows/ci.yml` — offline suite + secret scan on every
+  push/PR, plus a scheduled daily live eval (03:00 UTC, quota-aware).
+- **Tooling:** `uv` with a committed lockfile; CI syncs `--frozen`.
+- **Containers:** `Dockerfile` + `compose.yml` (worker one-turn-per-invocation,
+  optional HTTP MCP, json-file log rotation) — **provided but never executed;
+  treat as untested** (`area/devops` welcome).
+- **Secrets:** `.env` locally, real environment variables in deployment;
+  `test_config.py` scans committed files for credential patterns.
+
+#### Security & access
+
+There is no OAuth layer — FEDS is a single-tenant agent with explicit,
+audited controls instead:
+
+| Control | Implementation |
+|---|---|
+| Human approval gate | `approvals` writable only by `feds_approver` (DB-enforced, SECURITY DEFINER) |
+| Who may approve | `FEDS_ALLOWED_OPERATORS` allowlist; refusals write `approval_refused` |
+| Per-request identity | `set_user` / `get_current_user` MCP tools; memory isolation in SQL |
+| Prompt-injection defense | provenance stamping + retrieval contract (`security_ingestion.py`) |
+| Input guardrails | `_GUARDRAIL_BLOCKERS` blocks only trust-boundary subversion |
+| Spend limits | `budget_manager` monthly caps, warning threshold, hard cap |
+| Secrets | gitignored `.env` + planted-secret scanner in the test gate |
+| Execution | `sandbox_executor.py` with credentials stripped |
+| Network | MCP refuses a non-loopback bind without `MCP_ALLOW_REMOTE=1` |
 
 ---
 
@@ -337,17 +393,22 @@ AGENTS.md                       working contract for contributors and agents
 - [`AGENTS.md`](AGENTS.md) is the working contract: read order, definition of
   done, and **Open work** — the current backlog of what is missing, with file
   pointers and acceptance criteria.
+- [`ROADMAP.md`](ROADMAP.md) is the curated roadmap (now → v1 leftovers →
+  v1.1 → v2), and [`docs/extending-feds.md`](docs/extending-feds.md) shows how
+  to add a skill, an MCP tool, or a standalone integration.
 - Participation is governed by our [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
 
 ---
 
-## Project status and license
+## Project status
 
 v1 governance and proof features are shipped; the terminal TUI landed
 recently. The prioritized roadmap lives in [`sanghaar.md`](sanghaar.md), and
 what is missing right now is tracked in the **Open work** section of
 [`AGENTS.md`](AGENTS.md).
 
-**No license file yet.** The choice (MIT vs Apache-2.0) is tracked in
-`AGENTS.md` → Open work. Until it lands, all rights are reserved — do not
-assume permissive terms.
+## License
+
+FEDS is released under the [MIT License](LICENSE) — free to use, study,
+modify, and redistribute; keep the copyright notice. See the file for the
+full terms.

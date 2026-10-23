@@ -196,8 +196,6 @@ def _local_skill_text() -> str:
 
 # Embedded runtime configuration lives in config.py so the worker and the
 # scoped MCP server can never drift apart on a credential or model name.
-# Secrets are embedded as requested for this live deployment; move them to a
-# managed secret store before sharing this source.
 from config import (  # noqa: E402
     AGENT_NAME,
     CHAT_MODELS,
